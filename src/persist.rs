@@ -24,7 +24,7 @@ pub struct Config {
 }
 
 fn default_theme() -> String {
-    "aurora".into()
+    "crimson".into()
 }
 fn default_host() -> String {
     "127.0.0.1".into()
@@ -63,10 +63,16 @@ impl Config {
     }
 
     pub fn resolved_password(&self) -> String {
-        if !self.password.is_empty() {
-            return self.password.clone();
-        }
-        std::env::var("NEXUS_MSF_RPC_PASS").unwrap_or_default()
+        Self::password_with_override(
+            &self.password,
+            std::env::var("NEXUS_MSF_RPC_PASS").ok().as_deref(),
+        )
+    }
+    fn password_with_override(configured: &str, overridden: Option<&str>) -> String {
+        overridden
+            .filter(|s| !s.is_empty())
+            .unwrap_or(configured)
+            .to_owned()
     }
 }
 
@@ -188,4 +194,74 @@ pub fn seed_defaults(paths: &Paths) -> anyhow::Result<()> {
         save_config(&paths.config, &Config::default())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod password_override_tests {
+    use super::*;
+    #[test]
+    fn explicit_environment_password_overrides_saved_password() {
+        assert_eq!(
+            Config::password_with_override("saved", Some("explicit")),
+            "explicit"
+        );
+        assert_eq!(Config::password_with_override("saved", Some("")), "saved");
+        assert_eq!(Config::password_with_override("saved", None), "saved");
+    }
+}
+
+pub fn save_private_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+pub fn load_tasks(path: &Path) -> Vec<crate::model::TaskLog> {
+    let mut tasks: Vec<crate::model::TaskLog> = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    for task in &mut tasks {
+        if task.status == "running" {
+            task.status = "interrupted".into();
+            task.detail.push_str("\nApp closed before completion was recorded; inspect Framework jobs before restarting.");
+        }
+    }
+    tasks
+}
+pub fn load_validations(path: &Path) -> Vec<crate::model::ValidationResult> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod workflow_persistence_tests {
+    #[test]
+    fn task_restart_marks_running_interrupted_and_keeps_completed_records() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        let running = crate::model::TaskLog::new("chain", "queued");
+        let mut complete = running.clone();
+        complete.status = "complete".into();
+        super::save_private_json(&path, &vec![running, complete]).unwrap();
+        let records = super::load_tasks(&path);
+        assert_eq!(records[0].status, "interrupted");
+        assert_eq!(records[1].status, "complete");
+        assert!(records[0].detail.contains("Framework jobs"));
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

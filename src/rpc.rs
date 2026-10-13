@@ -36,6 +36,7 @@ pub fn rpc_error(v: &Value) -> Option<String> {
     }
 }
 
+#[derive(Clone)]
 pub struct Client {
     url: String,
     http: reqwest::Client,
@@ -45,7 +46,12 @@ pub struct Client {
 impl Client {
     pub fn new(cfg: &Config) -> Result<Self> {
         let scheme = if cfg.ssl { "https" } else { "http" };
-        let url = format!("{scheme}://{}:{}{}", cfg.host, cfg.port, cfg.uri);
+        let host = if cfg.host.contains(':') && !cfg.host.starts_with('[') {
+            format!("[{}]", cfg.host)
+        } else {
+            cfg.host.clone()
+        };
+        let url = format!("{scheme}://{host}:{}{}", cfg.port, cfg.uri);
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .connect_timeout(Duration::from_secs(2))
@@ -57,6 +63,10 @@ impl Client {
             http,
             token: None,
         })
+    }
+
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.url
     }
 
     pub async fn call(&self, method: &str, args: &[Value]) -> Result<Value> {
@@ -74,6 +84,9 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("POST {method}"))?;
+        let resp = resp
+            .error_for_status()
+            .with_context(|| format!("HTTP response for {method}"))?;
         let bytes = resp.bytes().await?;
         let v = decode_value(&bytes)?;
         if let Some(err) = rpc_error(&v) {
@@ -82,6 +95,31 @@ impl Client {
         Ok(v)
     }
 
+    async fn workspace_rows(&self, method: &str, workspace: &str) -> Result<Value> {
+        let key = method.strip_prefix("db.").context("database method")?;
+        let mut all = Vec::new();
+        loop {
+            let options = Value::Map(vec![
+                (Value::from("workspace"), Value::from(workspace)),
+                (Value::from("limit"), Value::from(100)),
+                (Value::from("offset"), Value::from(all.len() as u64)),
+            ]);
+            let response = self.call(method, &[options]).await?;
+            let map =
+                as_map(&response).with_context(|| format!("{method}: expected response map"))?;
+            let page = map
+                .iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.as_array())
+                .with_context(|| format!("{method}: missing {key} rows"))?;
+            let complete = page.len() < 100;
+            all.extend(page.iter().cloned());
+            if complete {
+                break;
+            }
+        }
+        Ok(Value::Map(vec![(Value::from(key), Value::Array(all))]))
+    }
     pub async fn login(&mut self, user: &str, pass: &str) -> Result<()> {
         let v = self
             .call("auth.login", &[Value::from(user), Value::from(pass)])
@@ -98,20 +136,23 @@ pub enum Cmd {
     Connect,
     #[allow(dead_code)]
     Disconnect,
+    Shutdown(tokio::sync::oneshot::Sender<()>),
     Refresh,
     ConsoleWrite(String),
+    RunWorkflow(Box<crate::workflow::Request>),
+    CancelWorkflow(String),
+    GeneratePayload {
+        id: String,
+        argv: Vec<String>,
+    },
+    SessionRead {
+        id: String,
+        meterpreter: bool,
+    },
     SessionWrite {
         id: String,
         data: String,
         meterpreter: bool,
-    },
-    ExecuteModule {
-        kind: String,
-        name: String,
-        opts: HashMap<String, String>,
-    },
-    ImportData {
-        path: String,
     },
     SetWorkspace(String),
     JobStop(String),
@@ -123,14 +164,14 @@ pub enum Cmd {
     ListModules {
         kind: String,
     },
-    ConsoleDiscover {
-        rhosts: String,
-        ports: String,
-    },
 }
 
 #[derive(Debug)]
 pub enum Event {
+    WorkflowFinished(String),
+    PlanReady(Vec<PlanItem>),
+    Validation(ValidationResult),
+    ReportReady(PathBuf),
     Status(String),
     Connected(Snapshot),
     Snapshot(Snapshot),
@@ -148,7 +189,6 @@ pub enum Event {
         names: Vec<String>,
     },
     Error(String),
-    #[allow(dead_code)]
     TaskUpdate {
         id: String,
         status: String,
@@ -169,6 +209,12 @@ struct Worker {
     child: Option<Child>,
     console_id: Option<String>,
     ev: mpsc::UnboundedSender<Event>,
+    session_reads: HashMap<String, bool>,
+    active: Option<(
+        String,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
 }
 
 async fn worker_loop(
@@ -181,6 +227,8 @@ async fn worker_loop(
         client: None,
         child: None,
         console_id: None,
+        session_reads: HashMap::new(),
+        active: None,
         ev,
     };
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
@@ -188,9 +236,11 @@ async fn worker_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if w.client.is_some() {
+                if w.active.as_ref().is_some_and(|(_,_,task)|task.is_finished()){w.active=None;}
+                if w.client.is_some() && w.active.is_none() {
                     let _ = w.refresh().await;
                     let _ = w.poll_console().await;
+                    w.poll_sessions().await;
                 }
             }
             msg = cmds.recv() => {
@@ -201,6 +251,7 @@ async fn worker_loop(
             }
         }
     }
+    w.shutdown().await;
 }
 
 impl Worker {
@@ -209,8 +260,85 @@ impl Worker {
     }
 
     async fn handle(&mut self, cmd: Cmd) -> Result<()> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(_, _, task)| task.is_finished())
+        {
+            self.active = None;
+        }
+        if self.active.is_some()
+            && matches!(
+                cmd,
+                Cmd::Connect
+                    | Cmd::SetWorkspace(_)
+                    | Cmd::ConsoleWrite(_)
+                    | Cmd::SessionWrite { .. }
+            )
+        {
+            bail!(
+                "a workflow is active; cancel it before changing workspace or starting another operation"
+            );
+        }
         match cmd {
+            Cmd::RunWorkflow(request) => {
+                if self.active.is_some() || self.client.is_none() {
+                    self.emit(Event::TaskUpdate {
+                        id: request.id.clone(),
+                        status: "failed".into(),
+                        detail: "another workflow is active or RPC is disconnected".into(),
+                    });
+                    self.emit(Event::WorkflowFinished(request.id));
+                    return Ok(());
+                }
+                let client = self.cli()?.clone();
+                let ev = self.ev.clone();
+                let (cancel, rx) = tokio::sync::watch::channel(false);
+                let id = request.id.clone();
+                let task =
+                    tokio::spawn(crate::workflow::Runner::new(client, ev, rx, *request).run());
+                self.active = Some((id, cancel, task));
+                Ok(())
+            }
+            Cmd::CancelWorkflow(id) => {
+                if let Some((active, cancel, _)) = &self.active {
+                    if active == &id {
+                        let _ = cancel.send(true);
+                    }
+                }
+                Ok(())
+            }
+            Cmd::GeneratePayload { id, argv } => {
+                if self.active.is_some() {
+                    self.emit(Event::TaskUpdate {
+                        id: id.clone(),
+                        status: "failed".into(),
+                        detail: "another workflow is active".into(),
+                    });
+                    self.emit(Event::WorkflowFinished(id));
+                    return Ok(());
+                }
+                let ev = self.ev.clone();
+                let task_id = id.clone();
+                let (cancel, rx) = tokio::sync::watch::channel(false);
+                let task = tokio::spawn(async move {
+                    let (status, detail) = crate::venom::generate_cancellable(&argv, rx).await;
+                    let _ = ev.send(Event::TaskUpdate {
+                        id: task_id.clone(),
+                        status,
+                        detail,
+                    });
+                    let _ = ev.send(Event::WorkflowFinished(task_id));
+                });
+                self.active = Some((id, cancel, task));
+                Ok(())
+            }
             Cmd::Connect => self.connect().await,
+            Cmd::Shutdown(done) => {
+                self.shutdown().await;
+                let _ = done.send(());
+                Ok(())
+            }
             Cmd::Disconnect => {
                 self.shutdown().await;
                 self.emit(Event::Status("disconnected".into()));
@@ -218,13 +346,15 @@ impl Worker {
             }
             Cmd::Refresh => self.refresh().await,
             Cmd::ConsoleWrite(s) => self.console_write(&s).await,
+            Cmd::SessionRead { id, meterpreter } => {
+                self.session_reads.insert(id.clone(), meterpreter);
+                self.read_session(&id, meterpreter).await
+            }
             Cmd::SessionWrite {
                 id,
                 data,
                 meterpreter,
             } => self.session_write(&id, &data, meterpreter).await,
-            Cmd::ExecuteModule { kind, name, opts } => self.execute(&kind, &name, opts).await,
-            Cmd::ImportData { path } => self.import_data(&path).await,
             Cmd::SetWorkspace(name) => self.set_workspace(&name).await,
             Cmd::JobStop(id) => {
                 let c = self.cli()?;
@@ -236,19 +366,12 @@ impl Worker {
                 let sid = parse_sid(&id);
                 let c = self.cli()?;
                 let _ = c.call("session.stop", &[sid]).await?;
+                self.session_reads.remove(&id);
                 self.emit(Event::Status(format!("stopped session {id}")));
                 self.refresh().await
             }
             Cmd::FetchModule { kind, name } => self.fetch_module(&kind, &name).await,
             Cmd::ListModules { kind } => self.list_modules(&kind).await,
-            Cmd::ConsoleDiscover { rhosts, ports } => {
-                let cmd = if ports.is_empty() {
-                    format!("db_nmap -sV {rhosts}\n")
-                } else {
-                    format!("db_nmap -sV -p {ports} {rhosts}\n")
-                };
-                self.console_write(&cmd).await
-            }
         }
     }
 
@@ -306,28 +429,10 @@ impl Worker {
         if pass.is_empty() {
             bail!("no RPC password (set NEXUS_MSF_RPC_PASS or config.password)");
         }
-        let users = unique_users(&self.cfg.username);
-        let ssls = [self.cfg.ssl, !self.cfg.ssl];
-        let mut last = None;
-        for ssl in ssls {
-            for user in &users {
-                let mut cfg = self.cfg.clone();
-                cfg.ssl = ssl;
-                match Client::new(&cfg) {
-                    Ok(mut c) => match c.login(user, &pass).await {
-                        Ok(()) => {
-                            self.cfg.ssl = ssl;
-                            self.cfg.username = user.clone();
-                            self.client = Some(c);
-                            return Ok(());
-                        }
-                        Err(e) => last = Some(e),
-                    },
-                    Err(e) => last = Some(e),
-                }
-            }
-        }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("login failed")))
+        let mut client = Client::new(&self.cfg)?;
+        client.login(&self.cfg.username, &pass).await?;
+        self.client = Some(client);
+        Ok(())
     }
 
     async fn spawn_msfrpcd(&mut self) -> Result<()> {
@@ -349,13 +454,17 @@ impl Worker {
             "127.0.0.1",
             "-p",
             &port,
-            "-S",
             "-f",
         ])
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
+        if !self.cfg.ssl {
+            cmd.arg("-S");
+        }
+        // The spawned daemon binds IPv4 loopback, regardless of a localhost alias.
+        self.cfg.host = "127.0.0.1".into();
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn {} (is Metasploit installed?)", bin.display()))?;
@@ -375,10 +484,20 @@ impl Worker {
     }
 
     async fn shutdown(&mut self) {
+        if let Some((_, cancel, mut task)) = self.active.take() {
+            let _ = cancel.send(true);
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
         if let (Some(c), Some(id)) = (self.client.as_ref(), self.console_id.as_ref()) {
             let _ = c.call("console.destroy", &[Value::from(id.as_str())]).await;
         }
         self.console_id = None;
+        self.session_reads.clear();
         self.client = None;
         if let Some(mut ch) = self.child.take() {
             let _ = ch.kill().await;
@@ -423,9 +542,7 @@ impl Worker {
         let map = as_map(&v).unwrap_or_default();
         let data = map_str(&map, "data").unwrap_or_default();
         let busy = map_bool(&map, "busy");
-        if !data.is_empty() || busy {
-            self.emit(Event::Console { data, busy });
-        }
+        self.emit(Event::Console { data, busy });
         Ok(())
     }
 
@@ -443,60 +560,40 @@ impl Worker {
         self.cli()?
             .call(method, &[parse_sid(id), Value::from(payload)])
             .await?;
-        let read = if meterpreter {
+        self.session_reads.insert(id.to_owned(), meterpreter);
+        self.read_session(id, meterpreter).await
+    }
+    async fn read_session(&mut self, id: &str, meterpreter: bool) -> Result<()> {
+        let method = if meterpreter {
             "session.meterpreter_read"
         } else {
             "session.shell_read"
         };
-        let v = self.cli()?.call(read, &[parse_sid(id)]).await?;
-        let text = if let Some(m) = as_map(&v) {
-            map_str(&m, "data").unwrap_or_default()
-        } else {
-            value_string(&v).unwrap_or_default()
-        };
-        self.emit(Event::SessionIo {
-            id: id.into(),
-            data: text,
-        });
+        let v = self.cli()?.call(method, &[parse_sid(id)]).await?;
+        let text = as_map(&v)
+            .and_then(|m| map_str(&m, "data"))
+            .or_else(|| value_string(&v))
+            .unwrap_or_default();
+        if !text.is_empty() {
+            self.emit(Event::SessionIo {
+                id: id.into(),
+                data: text,
+            });
+        }
         Ok(())
     }
-
-    async fn execute(
-        &mut self,
-        kind: &str,
-        name: &str,
-        opts: HashMap<String, String>,
-    ) -> Result<()> {
-        let mut map = Vec::new();
-        for (k, v) in opts {
-            map.push((Value::from(k), Value::from(v)));
+    async fn poll_sessions(&mut self) {
+        let sessions: Vec<_> = self
+            .session_reads
+            .iter()
+            .map(|(id, kind)| (id.clone(), *kind))
+            .collect();
+        for (id, kind) in sessions {
+            if let Err(error) = self.read_session(&id, kind).await {
+                self.session_reads.remove(&id);
+                self.emit(Event::Error(format!("session {id}: {error}")));
+            }
         }
-        let v = self
-            .cli()?
-            .call(
-                "module.execute",
-                &[Value::from(kind), Value::from(name), Value::Map(map)],
-            )
-            .await?;
-        let parsed = as_map(&v).unwrap_or_default();
-        let job = map_str(&parsed, "job_id").unwrap_or_else(|| "?".into());
-        self.emit(Event::Status(format!("executed {kind}/{name} job={job}")));
-        self.refresh().await
-    }
-
-    async fn import_data(&mut self, path: &str) -> Result<()> {
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("read {path}"))?;
-        let data = String::from_utf8_lossy(&bytes).to_string();
-        self.cli()?
-            .call(
-                "db.import_data",
-                &[Value::Map(vec![(Value::from("data"), Value::from(data))])],
-            )
-            .await?;
-        self.emit(Event::Status(format!("imported {path}")));
-        self.refresh().await
     }
 
     async fn set_workspace(&mut self, name: &str) -> Result<()> {
@@ -580,7 +677,26 @@ impl Worker {
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot> {
-        let c = self.cli()?;
+        self.cli()?.snapshot().await
+    }
+}
+
+impl Client {
+    pub(crate) async fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_policy(false).await
+    }
+    pub(crate) async fn strict_snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_policy(true).await
+    }
+    async fn snapshot_rows(&self, method: &str, workspace: &str, strict: bool) -> Result<Value> {
+        match self.workspace_rows(method, workspace).await {
+            Ok(value) => Ok(value),
+            Err(error) if strict => Err(error),
+            Err(_) => Ok(Value::Nil),
+        }
+    }
+    async fn snapshot_policy(&self, strict: bool) -> Result<Snapshot> {
+        let c = self;
         let ver = c.call("core.version", &[]).await.unwrap_or(Value::Nil);
         let ver_map = as_map(&ver).unwrap_or_default();
         let db = c.call("db.status", &[]).await.unwrap_or(Value::Nil);
@@ -588,6 +704,9 @@ impl Worker {
         let stats = c.call("core.module_stats", &[]).await.unwrap_or(Value::Nil);
         let st_map = as_map(&stats).unwrap_or_default();
         let ws = c.call("db.current_workspace", &[]).await.ok();
+        if strict {
+            anyhow::ensure!(ws.is_some(), "cannot resolve current workspace");
+        }
         let workspace = ws
             .as_ref()
             .and_then(|v| {
@@ -596,40 +715,30 @@ impl Worker {
                     .or_else(|| v.as_str().map(|s| s.to_string()))
             })
             .unwrap_or_else(|| "default".into());
+        if strict {
+            anyhow::ensure!(
+                map_str(&db_map, "db").is_some() || map_bool(&db_map, "ok"),
+                "Framework database is disconnected; connect it before running workspace workflows"
+            );
+        }
         let wslist = c.call("db.workspaces", &[]).await.unwrap_or(Value::Nil);
         let workspaces = parse_workspaces(&wslist);
-        let hosts = parse_hosts(
-            &c.call("db.hosts", &[empty_ws(&workspace)])
-                .await
-                .unwrap_or(Value::Nil),
-        );
-        let services = parse_services(
-            &c.call("db.services", &[empty_ws(&workspace)])
-                .await
-                .unwrap_or(Value::Nil),
-        );
-        let vulns = parse_vulns(
-            &c.call("db.vulns", &[empty_ws(&workspace)])
-                .await
-                .unwrap_or(Value::Nil),
-        );
-        let notes = parse_notes(
-            &c.call("db.notes", &[empty_ws(&workspace)])
-                .await
-                .unwrap_or(Value::Nil),
-        );
-        let creds = parse_creds(
-            &c.call("db.creds", &[empty_ws(&workspace)])
-                .await
-                .unwrap_or(Value::Nil),
-        );
-        let loot = parse_loot(
-            &c.call("db.loots", &[empty_ws(&workspace)])
-                .await
-                .unwrap_or(Value::Nil),
-        );
-        let sessions = parse_sessions(&c.call("session.list", &[]).await.unwrap_or(Value::Nil));
-        let jobs = parse_jobs(&c.call("job.list", &[]).await.unwrap_or(Value::Nil));
+        let hosts = parse_hosts(&c.snapshot_rows("db.hosts", &workspace, strict).await?);
+        let services = parse_services(&c.snapshot_rows("db.services", &workspace, strict).await?);
+        let vulns = parse_vulns(&c.snapshot_rows("db.vulns", &workspace, strict).await?);
+        let notes = parse_notes(&c.snapshot_rows("db.notes", &workspace, strict).await?);
+        let creds = parse_creds(&c.snapshot_rows("db.creds", &workspace, strict).await?);
+        let loot = parse_loot(&c.snapshot_rows("db.loots", &workspace, strict).await?);
+        let sessions = parse_sessions(&match c.call("session.list", &[]).await {
+            Ok(v) => v,
+            Err(e) if strict => return Err(e),
+            Err(_) => Value::Nil,
+        });
+        let jobs = parse_jobs(&match c.call("job.list", &[]).await {
+            Ok(v) => v,
+            Err(e) if strict => return Err(e),
+            Err(_) => Value::Nil,
+        });
 
         let mut host_map: HashMap<String, Host> = HashMap::new();
         for h in hosts {
@@ -655,8 +764,7 @@ impl Worker {
         Ok(Snapshot {
             version: map_str(&ver_map, "version").unwrap_or_else(|| "unknown".into()),
             ruby: map_str(&ver_map, "ruby").unwrap_or_default(),
-            db_ok: map_str(&db_map, "driver").is_some_and(|d| d != "unknown")
-                || map_bool(&db_map, "ok"),
+            db_ok: map_str(&db_map, "db").is_some() || map_bool(&db_map, "ok"),
             workspace,
             workspaces,
             hosts,
@@ -675,17 +783,6 @@ impl Worker {
             },
         })
     }
-}
-
-fn unique_users(primary: &str) -> Vec<String> {
-    let mut v = Vec::new();
-    if !primary.is_empty() {
-        v.push(primary.to_string());
-    }
-    if primary != "msf" {
-        v.push("msf".into());
-    }
-    v
 }
 
 fn find_msfrpcd() -> Option<PathBuf> {
@@ -721,10 +818,6 @@ fn find_msfrpcd() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn empty_ws(ws: &str) -> Value {
-    Value::Map(vec![(Value::from("workspace"), Value::from(ws))])
-}
-
 fn parse_sid(id: &str) -> Value {
     if let Ok(n) = id.parse::<i64>() {
         Value::from(n)
@@ -745,6 +838,9 @@ pub fn value_string(v: &Value) -> Option<String> {
             return Some(s.to_string());
         }
     }
+    if let Some(b) = v.as_bool() {
+        return Some(b.to_string());
+    }
     if let Some(n) = v.as_i64() {
         return Some(n.to_string());
     }
@@ -754,7 +850,7 @@ pub fn value_string(v: &Value) -> Option<String> {
     None
 }
 
-pub fn as_map(v: &Value) -> Option<Map> {
+pub(crate) fn as_map(v: &Value) -> Option<Map> {
     let m = v.as_map()?;
     Some(
         m.iter()
@@ -763,13 +859,13 @@ pub fn as_map(v: &Value) -> Option<Map> {
     )
 }
 
-pub fn map_str(map: &Map, k: &str) -> Option<String> {
+pub(crate) fn map_str(map: &Map, k: &str) -> Option<String> {
     map.iter()
         .find(|(key, _)| key == k)
         .and_then(|(_, v)| value_string(v))
 }
 
-fn map_bool(map: &Map, k: &str) -> bool {
+pub(crate) fn map_bool(map: &Map, k: &str) -> bool {
     map.iter()
         .find(|(key, _)| key == k)
         .is_some_and(|(_, v)| v.as_bool().unwrap_or(false))
@@ -906,7 +1002,9 @@ fn parse_creds(v: &Value) -> Vec<Cred> {
             kind: map_str(&m, "ptype")
                 .or_else(|| map_str(&m, "type"))
                 .unwrap_or_default(),
-            realm: map_str(&m, "realm").unwrap_or_default(),
+            realm: map_str(&m, "realm_value")
+                .or_else(|| map_str(&m, "realm"))
+                .unwrap_or_default(),
         })
         .collect()
 }
@@ -994,13 +1092,13 @@ pub fn parse_module_info(kind: &str, name: &str, v: &Value) -> ModuleInfo {
         if let Some(arr) = rv.as_array() {
             for item in arr {
                 if let Some(pair) = item.as_array() {
-                    let a = pair.first().and_then(|x| x.as_str()).unwrap_or("");
-                    let b = pair.get(1).and_then(|x| x.as_str()).unwrap_or("");
+                    let a = pair.first().and_then(value_string).unwrap_or_default();
+                    let b = pair.get(1).and_then(value_string).unwrap_or_default();
                     if !b.is_empty() {
                         refs.push(format!("{a}-{b}"));
                     }
-                } else if let Some(s) = item.as_str() {
-                    refs.push(s.into());
+                } else if let Some(s) = value_string(item) {
+                    refs.push(s);
                 }
             }
         }
@@ -1016,7 +1114,7 @@ pub fn parse_module_info(kind: &str, name: &str, v: &Value) -> ModuleInfo {
     }
 }
 
-fn parse_options(v: &Value) -> Vec<ModuleOption> {
+pub(crate) fn parse_options(v: &Value) -> Vec<ModuleOption> {
     let mut out = Vec::new();
     let Some(map) = as_map(v) else {
         return out;
@@ -1039,7 +1137,7 @@ fn parse_options(v: &Value) -> Vec<ModuleOption> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1073,5 +1171,268 @@ mod tests {
         let map = as_map(&v).expect("map");
         assert_eq!(map_str(&map, "result").as_deref(), Some("success"));
         assert_eq!(map_str(&map, "token").unwrap().len(), 32);
+    }
+    pub(crate) async fn mock_rpc(
+        replies: Vec<(&'static str, Value)>,
+    ) -> (Config, tokio::task::JoinHandle<Vec<Value>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = Config {
+            port: listener.local_addr().unwrap().port(),
+            spawn: false,
+            ..Default::default()
+        };
+        let task = tokio::spawn(async move {
+            let mut calls = Vec::new();
+            for (method, response) in replies {
+                let (mut stream, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                let (offset, length) = loop {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while request.len() < offset + length {
+                    let n = stream.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let call = decode_value(&request[offset..offset + length]).unwrap();
+                assert_eq!(call.as_array().unwrap()[0].as_str(), Some(method));
+                calls.push(call);
+                let mut body = Vec::new();
+                rmpv::encode::write_value(&mut body, &response).unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: binary/message-pack\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+            calls
+        });
+        (cfg, task)
+    }
+    pub(crate) fn response(items: &[(&str, Value)]) -> Value {
+        Value::Map(
+            items
+                .iter()
+                .map(|(k, v)| (Value::from(*k), v.clone()))
+                .collect(),
+        )
+    }
+    fn test_worker(cfg: Config) -> (Worker, mpsc::UnboundedReceiver<Event>) {
+        let (ev, rx) = mpsc::unbounded_channel();
+        let mut client = Client::new(&cfg).unwrap();
+        client.token = Some("test-token".into());
+        (
+            Worker {
+                cfg,
+                client: Some(client),
+                child: None,
+                console_id: Some("0".into()),
+                session_reads: HashMap::new(),
+                active: None,
+                ev,
+            },
+            rx,
+        )
+    }
+    #[tokio::test]
+    async fn delayed_session_output_is_polled_after_the_first_read() {
+        let (cfg, server) = mock_rpc(vec![
+            (
+                "session.shell_write",
+                response(&[("write_count", Value::from(5))]),
+            ),
+            ("session.shell_read", response(&[("data", Value::from(""))])),
+            (
+                "session.shell_read",
+                response(&[("data", Value::from("later output 🦀"))]),
+            ),
+        ])
+        .await;
+        let (mut worker, mut events) = test_worker(cfg);
+        worker.session_write("7", "echo", false).await.unwrap();
+        assert!(events.try_recv().is_err());
+        worker.poll_sessions().await;
+        assert!(
+            matches!(events.try_recv().unwrap(),Event::SessionIo{id,data} if id=="7" && data=="later output 🦀")
+        );
+        let calls = server.await.unwrap();
+        assert_eq!(calls[0].as_array().unwrap()[1].as_str(), Some("test-token"));
+        assert_eq!(calls[0].as_array().unwrap()[3].as_str(), Some("echo\n"));
+    }
+    #[tokio::test]
+    async fn console_idle_without_output_is_emitted() {
+        let (cfg, server) = mock_rpc(vec![(
+            "console.read",
+            response(&[("data", Value::from("")), ("busy", Value::from(false))]),
+        )])
+        .await;
+        let (mut worker, mut events) = test_worker(cfg);
+        worker.poll_console().await.unwrap();
+        assert!(
+            matches!(events.try_recv().unwrap(),Event::Console{data,busy:false} if data.is_empty())
+        );
+        server.await.unwrap();
+    }
+    #[test]
+    fn ipv6_rpc_host_is_bracketed() {
+        let cfg = Config {
+            host: "::1".into(),
+            ..Default::default()
+        };
+        assert_eq!(Client::new(&cfg).unwrap().url, "http://[::1]:55553/api/");
+    }
+    #[tokio::test]
+    #[ignore = "read-only integration check against installed Metasploit"]
+    async fn installed_framework_readonly_rpc() {
+        let isolated = tempfile::tempdir().unwrap();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        let cfg = Config {
+            port,
+            username: "msf".into(),
+            password: uuid::Uuid::new_v4().to_string(),
+            spawn: false,
+            ..Default::default()
+        };
+        let mut daemon = tokio::process::Command::new("msfrpcd")
+            .args([
+                "-U",
+                &cfg.username,
+                "-P",
+                &cfg.password,
+                "-a",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "-S",
+                "-f",
+            ])
+            .env("MSF_CFGROOT_CONFIG", isolated.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let mut worker = Worker {
+            cfg,
+            client: None,
+            child: None,
+            console_id: None,
+            session_reads: HashMap::new(),
+            active: None,
+            ev,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if worker.try_login().await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "temporary RPC daemon did not become ready"
+            );
+            assert!(
+                daemon.try_wait().unwrap().is_none(),
+                "temporary RPC daemon exited"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        worker.ensure_console().await.unwrap();
+        let snap = worker.snapshot().await.unwrap();
+        assert!(
+            snap.version.starts_with('6'),
+            "unexpected Framework version {}",
+            snap.version
+        );
+        worker.list_modules("auxiliary").await.unwrap();
+        let mut found = false;
+        while let Ok(event) = events.try_recv() {
+            if let Event::ModuleList { names, .. } = event {
+                assert!(names.iter().any(|n| n == "scanner/ssh/ssh_version"));
+                found = true;
+            }
+        }
+        assert!(found);
+        worker
+            .fetch_module("auxiliary", "scanner/ssh/ssh_version")
+            .await
+            .unwrap();
+        assert!(
+            matches!(events.try_recv().unwrap(),Event::ModuleInfo(info) if info.options.iter().any(|option|option.name=="RHOSTS"))
+        );
+        worker.poll_console().await.unwrap();
+        let catalog = crate::catalog::live(
+            worker.client.as_ref().unwrap(),
+            &isolated.path().join("catalog.json"),
+            true,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            catalog.len() > 1000,
+            "live catalog should cover installed modules"
+        );
+        assert!(catalog.iter().any(|m| m.kind == "exploit"
+            && m.fullname == "windows/smb/ms17_010_eternalblue"
+            && m.refs.iter().any(|r| r == "CVE-2017-0144")));
+        assert!(
+            catalog
+                .iter()
+                .any(|m| m.kind == "auxiliary" && m.fullname == "scanner/ssh/ssh_version")
+        );
+        worker.shutdown().await;
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+    }
+    #[tokio::test]
+    async fn workspace_fetch_reads_more_than_one_page() {
+        let page = (0..100)
+            .map(|i| response(&[("address", Value::from(format!("192.0.2.{i}")))]))
+            .collect::<Vec<_>>();
+        let (cfg, server) = mock_rpc(vec![
+            ("db.hosts", response(&[("hosts", Value::Array(page))])),
+            (
+                "db.hosts",
+                response(&[(
+                    "hosts",
+                    Value::Array(vec![response(&[("address", Value::from("192.0.2.100"))])]),
+                )]),
+            ),
+        ])
+        .await;
+        let (worker, _) = test_worker(cfg);
+        let result = worker
+            .client
+            .as_ref()
+            .unwrap()
+            .workspace_rows("db.hosts", "audit")
+            .await
+            .unwrap();
+        assert_eq!(parse_hosts(&result).len(), 101);
+        let calls = server.await.unwrap();
+        let options = as_map(&calls[1].as_array().unwrap()[2]).unwrap();
+        assert_eq!(map_u32(&options, "offset"), 100);
+        assert_eq!(map_str(&options, "workspace").as_deref(), Some("audit"));
     }
 }

@@ -34,6 +34,10 @@ pub enum Step {
         #[serde(default = "default_true")]
         match_ports: bool,
     },
+    Validate {
+        #[serde(default = "default_rank")]
+        min_rank: String,
+    },
     CollectEvidence {
         #[serde(default = "default_macro")]
         r#macro: String,
@@ -74,7 +78,12 @@ impl Chain {
                 format!("discover {rhosts} ports={ports}")
             }
             Step::Import { path } => format!("import {path}"),
-            Step::AutoExploit { min_rank, .. } => format!("auto-exploit min={min_rank}"),
+            Step::AutoExploit {
+                min_rank,
+                match_vulns,
+                match_ports,
+            } => format!("auto-exploit min={min_rank} vulns={match_vulns} ports={match_ports}"),
+            Step::Validate { min_rank } => format!("validate min={min_rank}"),
             Step::CollectEvidence { r#macro } => format!("evidence macro={macro}"),
             Step::Report { formats } => format!("report {}", formats.join(",")),
             Step::Module { kind, name, .. } => format!("module {kind}/{name}"),
@@ -151,10 +160,8 @@ pub fn seed_example(dir: &Path) -> anyhow::Result<()> {
                 Step::Import {
                     path: "/tmp/scan.xml".into(),
                 },
-                Step::AutoExploit {
+                Step::Validate {
                     min_rank: "great".into(),
-                    match_vulns: true,
-                    match_ports: false,
                 },
                 Step::Report {
                     formats: vec!["md".into()],

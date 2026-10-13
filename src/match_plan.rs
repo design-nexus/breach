@@ -31,10 +31,10 @@ fn platform_ok(module: &ModuleMeta, host: &Host) -> bool {
     let Some(hint) = host_os_hint(&host.os) else {
         return true;
     };
-    module
-        .platforms
-        .iter()
-        .any(|p| p.to_ascii_lowercase().contains(hint))
+    module.platforms.iter().any(|p| {
+        let p = p.to_ascii_lowercase();
+        p.contains(hint) || p == "multi" || (p == "unix" && ["linux", "osx"].contains(&hint))
+    })
 }
 
 fn refs_overlap(module: &ModuleMeta, vuln_refs: &[String], vuln_name: &str) -> Option<String> {
@@ -51,10 +51,7 @@ fn refs_overlap(module: &ModuleMeta, vuln_refs: &[String], vuln_name: &str) -> O
         if r.is_empty() {
             continue;
         }
-        if mrefs
-            .iter()
-            .any(|m| m == r || m.contains(r) || r.contains(m.as_str()))
-        {
+        if mrefs.iter().any(|m| m == r) {
             return Some(r.clone());
         }
     }
@@ -83,6 +80,16 @@ fn service_match(module: &ModuleMeta, host: &Host) -> Option<(u16, String)> {
 }
 
 pub fn build_plan(hosts: &[Host], modules: &[ModuleMeta], min_rank: Rank) -> Vec<PlanItem> {
+    build_plan_with_policy(hosts, modules, min_rank, true, true)
+}
+
+pub fn build_plan_with_policy(
+    hosts: &[Host],
+    modules: &[ModuleMeta],
+    min_rank: Rank,
+    match_vulns: bool,
+    match_ports: bool,
+) -> Vec<PlanItem> {
     let mut items = Vec::new();
     for host in hosts {
         for module in modules {
@@ -96,14 +103,14 @@ pub fn build_plan(hosts: &[Host], modules: &[ModuleMeta], min_rank: Rank) -> Vec
                 continue;
             }
             let mut reason = None;
-            for v in &host.vulns {
+            for v in host.vulns.iter().filter(|_| match_vulns) {
                 if let Some(r) = refs_overlap(module, &v.refs, &v.name) {
                     reason = Some(format!("vuln ref {r} ({})", v.name));
                     break;
                 }
             }
             let mut rport = module.rport;
-            if reason.is_none() {
+            if reason.is_none() && match_ports {
                 if let Some((port, why)) = service_match(module, host) {
                     rport = Some(port);
                     reason = Some(why);
@@ -241,5 +248,44 @@ mod tests {
     fn normalize_variants() {
         assert_eq!(normalize_ref("cve 2017-0144"), "CVE-2017-0144");
         assert_eq!(normalize_ref("CVE-2017-0144"), "CVE-2017-0144");
+    }
+    #[test]
+    fn matching_filters_are_independent_and_cve_matches_are_exact() {
+        let host = Host {
+            address: "192.0.2.1".into(),
+            os: "Windows".into(),
+            services: vec![Service {
+                port: 445,
+                state: "open".into(),
+                ..Default::default()
+            }],
+            vulns: vec![Vuln {
+                name: "fixture".into(),
+                refs: vec!["CVE-2017-014".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            build_plan_with_policy(&[host.clone()], &[eternalblue()], Rank::Great, true, false)
+                .is_empty()
+        );
+        assert_eq!(
+            build_plan_with_policy(&[host.clone()], &[eternalblue()], Rank::Great, false, true)
+                .len(),
+            1
+        );
+        assert!(
+            build_plan_with_policy(&[host], &[eternalblue()], Rank::Great, false, false).is_empty()
+        );
+        let mut unix = eternalblue();
+        unix.platforms = vec!["unix".into()];
+        assert!(platform_ok(
+            &unix,
+            &Host {
+                os: "Linux".into(),
+                ..Default::default()
+            }
+        ));
     }
 }

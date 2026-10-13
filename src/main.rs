@@ -1,6 +1,7 @@
 mod app;
 #[cfg(test)]
 mod audit;
+mod aurora;
 mod catalog;
 mod chains;
 mod commands;
@@ -9,12 +10,14 @@ mod input;
 mod macros;
 mod match_plan;
 mod model;
+mod navigation;
 mod persist;
 mod reports;
 mod rpc;
 mod theme;
 mod ui;
 mod venom;
+mod workflow;
 
 use crate::app::{App, Tab};
 use clap::Parser;
@@ -33,6 +36,9 @@ use std::time::Duration;
                   Set NEXUS_MSF_RPC_PASS or config.toml password before connecting."
 )]
 struct Cli {
+    /// Disable terminal mouse capture
+    #[arg(long)]
+    no_mouse: bool,
     /// Walk the UI with sample data (no RPC)
     #[arg(long)]
     demo: bool,
@@ -70,8 +76,19 @@ async fn main() -> anyhow::Result<()> {
     app.start_rpc();
 
     let mut terminal = ratatui::init();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        previous(info);
+    }));
+
+    if !cli.no_mouse {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    }
     let result = run(&mut terminal, &mut app).await;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
+    app.shutdown_rpc().await;
     result
 }
 
@@ -80,7 +97,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::
     let mut ticks = tokio::time::interval(Duration::from_millis(200));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        let rendered = terminal.draw(|f| ui::draw(f, app))?;
+        aurora::paint_wordmark(rendered.buffer)?;
         if app.should_quit {
             break;
         }
@@ -93,6 +111,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> anyhow::
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key);
                     }
+                    Some(Ok(Event::Mouse(mouse)))=>app.navigation_mouse(mouse),
                     Some(Ok(Event::Resize(_, _))) => {}
                     Some(Err(e)) => anyhow::bail!(e),
                     None => break,

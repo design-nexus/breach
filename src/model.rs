@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: String,
     pub ruby: String,
@@ -16,7 +16,7 @@ pub struct Snapshot {
     pub module_stats: ModuleStats,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ModuleStats {
     pub exploits: u32,
     pub auxiliary: u32,
@@ -26,7 +26,7 @@ pub struct ModuleStats {
     pub nops: u32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Host {
     pub address: String,
     pub name: String,
@@ -37,7 +37,7 @@ pub struct Host {
     pub vulns: Vec<Vuln>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Service {
     pub port: u16,
     pub proto: String,
@@ -46,14 +46,14 @@ pub struct Service {
     pub info: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Vuln {
     pub name: String,
     pub refs: Vec<String>,
     pub info: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub kind: String,
@@ -69,13 +69,13 @@ pub struct Session {
     pub routes: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Cred {
     pub host: String,
     pub service: String,
@@ -85,7 +85,7 @@ pub struct Cred {
     pub realm: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Loot {
     pub host: String,
     pub ltype: String,
@@ -94,14 +94,14 @@ pub struct Loot {
     pub path: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Note {
     pub host: String,
     pub ntype: String,
     pub data: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ModuleMeta {
     pub kind: String,
     pub fullname: String,
@@ -112,7 +112,7 @@ pub struct ModuleMeta {
     pub description: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ModuleOption {
     pub name: String,
     pub required: bool,
@@ -123,7 +123,7 @@ pub struct ModuleOption {
     pub opt_type: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ModuleInfo {
     pub kind: String,
     pub fullname: String,
@@ -201,6 +201,8 @@ pub struct PlanItem {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskLog {
+    #[serde(default)]
+    pub workspace: String,
     pub id: String,
     pub started: String,
     pub kind: String,
@@ -212,6 +214,7 @@ pub struct TaskLog {
 impl TaskLog {
     pub fn new(kind: &str, summary: &str) -> Self {
         Self {
+            workspace: String::new(),
             id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
             started: chrono::Utc::now().format("%H:%M:%S").to_string(),
             kind: kind.into(),
@@ -251,4 +254,17 @@ impl ModuleKind {
             ModuleKind::Encoder => ModuleKind::Exploit,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ValidationResult {
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub checked_at: String,
+    pub host: String,
+    pub module: String,
+    pub code: String,
+    pub message: String,
+    pub details: serde_json::Value,
 }

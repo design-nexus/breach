@@ -1,4 +1,4 @@
-use crate::chains::{self, Chain, Step};
+use crate::chains::{self, Chain};
 use crate::demo;
 use crate::input::LineEdit;
 use crate::macros::{self, Macro};
@@ -7,6 +7,7 @@ use crate::model::*;
 use crate::persist::{self, AuditEntry, Config, Favorites, Paths};
 use crate::rpc::{self, Cmd, Event};
 use crate::venom::VenomSpec;
+use crate::workflow::{ModuleRun, Operation, Request};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
@@ -46,14 +47,14 @@ impl Tab {
         match self {
             Tab::Dash => "1 Dash",
             Tab::Hosts => "2 Hosts",
-            Tab::Modules => "3 Mods",
-            Tab::Sessions => "4 Sess",
+            Tab::Modules => "3 Modules",
+            Tab::Sessions => "4 Sessions",
             Tab::Creds => "5 Creds",
             Tab::Tasks => "6 Tasks",
             Tab::Chains => "7 Chains",
-            Tab::Reports => "8 Rpt",
-            Tab::Console => "9 Con",
-            Tab::Wizards => "0 Wiz",
+            Tab::Reports => "8 Reports",
+            Tab::Console => "9 Console",
+            Tab::Wizards => "0 Wizards",
         }
     }
 
@@ -133,6 +134,8 @@ pub enum Action {
     Report,
     SessionStop,
     JobStop,
+    CancelWorkflow,
+    ValidatePlan,
     CredReuse,
 }
 
@@ -155,6 +158,7 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub navigation: crate::navigation::State,
     pub detail_scroll: u16,
     pub commands: crate::commands::Palette,
     pub tab: Tab,
@@ -192,6 +196,8 @@ pub struct App {
     pub job_idx: usize,
     pub task_idx: usize,
     pub tasks: Vec<TaskLog>,
+    pub validations: Vec<ValidationResult>,
+    pub active_workflow: Option<String>,
     pub chains: Vec<Chain>,
     pub chain_idx: usize,
     pub macros: Vec<Macro>,
@@ -266,7 +272,10 @@ impl App {
                 config.host, config.port
             )
         };
+        let tasks = persist::load_tasks(&paths.data.join("tasks.json"));
+        let validations = persist::load_validations(&paths.data.join("validations.json"));
         Ok(Self {
+            navigation: crate::navigation::State::default(),
             commands: crate::commands::Palette::default(),
             detail_scroll: 0,
             tab: Tab::Dash,
@@ -312,7 +321,9 @@ impl App {
             cred_pane: CredPane::Creds,
             job_idx: 0,
             task_idx: 0,
-            tasks: Vec::new(),
+            tasks,
+            validations,
+            active_workflow: None,
             chains,
             chain_idx: 0,
             macros,
@@ -346,12 +357,35 @@ impl App {
     }
 
     fn send(&mut self, cmd: Cmd) {
-        if !self.demo && !self.connected && !matches!(cmd, Cmd::Connect | Cmd::Disconnect) {
+        if !self.demo
+            && !self.connected
+            && !matches!(
+                cmd,
+                Cmd::Connect | Cmd::Disconnect | Cmd::GeneratePayload { .. }
+            )
+        {
             self.status = "not connected — Ctrl-G on Dash to connect".into();
             return;
         }
         if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(cmd);
+            if let Err(error) = tx.send(cmd) {
+                self.status = "RPC worker stopped; reconnect before continuing".into();
+                self.connected = false;
+                if let Cmd::GeneratePayload { id, .. } = &error.0 {
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == *id) {
+                        task.status = "failed".into();
+                        task.detail = self.status.clone();
+                    }
+                    self.active_workflow = None;
+                }
+                if let Cmd::RunWorkflow(request) = error.0 {
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == request.id) {
+                        task.status = "failed".into();
+                        task.detail = self.status.clone();
+                    }
+                    self.active_workflow = None;
+                }
+            }
         }
     }
 
@@ -370,6 +404,31 @@ impl App {
 
     fn on_event(&mut self, e: Event) {
         match e {
+            Event::WorkflowFinished(id) => {
+                if self.active_workflow.as_ref() == Some(&id) {
+                    self.active_workflow = None;
+                }
+            }
+            Event::PlanReady(plan) => {
+                self.navigation.focus[9] = 1;
+                self.plan = plan;
+                self.plan_idx = 0;
+                if self.wizard != WizardKind::Validate {
+                    self.wizard = WizardKind::AutoPlan;
+                }
+                self.status = format!("plan: {} items ready for review", self.plan.len());
+            }
+            Event::Validation(result) => {
+                self.validations.push(result);
+                let _ = persist::save_private_json(
+                    &self.paths.data.join("validations.json"),
+                    &self.validations,
+                );
+            }
+            Event::ReportReady(dir) => {
+                self.last_report = dir.display().to_string();
+                self.status = format!("report {}", dir.display());
+            }
             Event::Status(s) => self.status = s,
             Event::Error(s) => {
                 self.busy = false;
@@ -407,7 +466,11 @@ impl App {
             Event::Console { data, busy } => {
                 self.console.push_str(&data);
                 if self.console.len() > 80_000 {
-                    self.console = self.console[self.console.len() - 60_000..].to_string();
+                    let mut start = self.console.len() - 60_000;
+                    while !self.console.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    self.console.drain(..start);
                 }
                 self.busy = busy;
             }
@@ -415,6 +478,11 @@ impl App {
                 self.session_io.entry(id).or_default().push_str(&data);
             }
             Event::ModuleInfo(info) => {
+                if self.selected_module_name().as_deref() != Some(info.fullname.as_str())
+                    || self.module_kind.as_str() != info.kind
+                {
+                    return;
+                }
                 self.module_info = Some(info);
                 self.option_idx = 0;
             }
@@ -427,6 +495,12 @@ impl App {
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     t.status = status;
                     t.detail = detail;
+                    self.status = format!("{}: {}", t.kind, t.status);
+                }
+                if let Err(error) =
+                    persist::save_private_json(&self.paths.data.join("tasks.json"), &self.tasks)
+                {
+                    self.status = format!("saving tasks: {error}");
                 }
             }
         }
@@ -534,20 +608,15 @@ impl App {
             self.handle_modal_key(key);
             return;
         }
+        if self.navigation_key(key) {
+            return;
+        }
         if self.commands.open
             || (key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
-            if let Some(action) = self.commands.handle(key, ACTIONS) {
-                if action.modifiers == KeyModifiers::ALT {
-                    let id = match action.key {
-                        KeyCode::Char('o') => "omarchy",
-                        KeyCode::Char('t') => "terminal",
-                        _ => "aurora",
-                    };
-                    self.apply_aurora_theme(id);
-                } else {
-                    self.handle_key(action.event());
-                }
+            let actions = self.command_actions();
+            if let Some(action) = self.commands.handle(key, &actions) {
+                self.dispatch_intent(action.target);
             }
             return;
         }
@@ -572,20 +641,26 @@ impl App {
                 _ => {}
             }
         }
-        if self.tab == Tab::Console && !key.modifiers.contains(KeyModifiers::CONTROL) {
+        if self.tab == Tab::Wizards && self.focused_pane() == 0 && key.code == KeyCode::Enter {
+            self.focus_pane(1);
+            return;
+        }
+        if self.tab == Tab::Sessions && key.code == KeyCode::Enter && !self.interact {
+            self.focus_pane(1);
+            self.begin_interaction();
+            return;
+        }
+        if self.tab == Tab::Console
+            && self.focused_pane() == 1
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             match key.code {
-                KeyCode::Char(c @ '0'..='9') if self.console_in.value.is_empty() => {
-                    if let Some(t) = Tab::from_digit(c) {
-                        self.tab = t;
-                        return;
-                    }
-                }
                 KeyCode::Char('?') if self.console_in.value.is_empty() => {
                     self.modal = Modal::Help;
                     return;
                 }
                 KeyCode::Esc => {
-                    self.tab = Tab::Dash;
+                    self.focus_pane(0);
                     return;
                 }
                 KeyCode::Enter => {
@@ -643,7 +718,91 @@ impl App {
                 }
             }
         }
+        if self.tab == Tab::Console && self.focused_pane() == 0 && key.code == KeyCode::Enter {
+            self.focus_pane(1);
+            return;
+        }
+        if self.tab == Tab::Wizards
+            && self.focused_pane() == 0
+            && matches!(
+                key.code,
+                KeyCode::Down | KeyCode::Up | KeyCode::Char('j' | 'k')
+            )
+        {
+            self.navigation_scroll(
+                0,
+                if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                    1
+                } else {
+                    -1
+                },
+            );
+            return;
+        }
+        if self.tab == Tab::Modules
+            && self.focused_pane() == 1
+            && matches!(
+                key.code,
+                KeyCode::Down | KeyCode::Up | KeyCode::Char('j' | 'k')
+            )
+        {
+            self.navigation_scroll(
+                1,
+                if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                    1
+                } else {
+                    -1
+                },
+            );
+            return;
+        }
         match key.code {
+            KeyCode::PageDown
+                if self.tab == Tab::Wizards && self.wizard == WizardKind::AutoPlan =>
+            {
+                self.plan_idx = (self.plan_idx + 8).min(self.plan.len().saturating_sub(1));
+                return;
+            }
+            KeyCode::PageUp if self.tab == Tab::Wizards && self.wizard == WizardKind::AutoPlan => {
+                self.plan_idx = self.plan_idx.saturating_sub(8);
+                return;
+            }
+            KeyCode::PageDown
+                if matches!(
+                    self.tab,
+                    Tab::Tasks | Tab::Wizards | Tab::Chains | Tab::Reports
+                ) =>
+            {
+                self.detail_scroll = self.detail_scroll.saturating_add(8);
+                return;
+            }
+            KeyCode::PageUp
+                if matches!(
+                    self.tab,
+                    Tab::Tasks | Tab::Wizards | Tab::Chains | Tab::Reports
+                ) =>
+            {
+                self.detail_scroll = self.detail_scroll.saturating_sub(8);
+                return;
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.active_workflow.is_some() {
+                    self.confirm(
+                        Action::CancelWorkflow,
+                        "Cancel active workflow?",
+                        "Requests the current Framework job to stop and cancels remaining steps.",
+                    );
+                }
+                return;
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.confirm(
+                    Action::ValidatePlan,
+                    "Check selected plan modules?",
+                    "Runs supported module.check methods against selected targets.",
+                );
+                return;
+            }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -657,8 +816,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab => self.cycle_pane(1),
-            KeyCode::BackTab => self.cycle_pane(-1),
+            KeyCode::F(6) => {}
+
             KeyCode::Char('/') => {
                 self.filtering = true;
                 self.edit = LineEdit::new(self.filter.clone());
@@ -694,39 +853,6 @@ impl App {
         }
     }
 
-    fn cycle_pane(&mut self, dir: i32) {
-        match self.tab {
-            Tab::Hosts => {
-                self.host_pane = if self.host_pane == HostPane::List {
-                    HostPane::Detail
-                } else {
-                    HostPane::List
-                };
-            }
-            Tab::Creds => {
-                self.cred_pane = if self.cred_pane == CredPane::Creds {
-                    CredPane::Loot
-                } else {
-                    CredPane::Creds
-                };
-            }
-            Tab::Modules if dir > 0 => {
-                self.module_kind = self.module_kind.next();
-                self.module_idx = 0;
-                self.ensure_module_list();
-                self.fetch_selected_module();
-            }
-            Tab::Wizards => {
-                let all = WizardKind::all();
-                let i = all.iter().position(|w| *w == self.wizard).unwrap_or(0) as i32;
-                let n = all.len() as i32;
-                self.wizard = all[((i + dir).rem_euclid(n)) as usize];
-                self.wiz_field = 0;
-            }
-            _ => {}
-        }
-    }
-
     fn handle_filter_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -746,6 +872,19 @@ impl App {
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Modal::Confirm { .. } | Modal::Message { .. }) {
+            match key.code {
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(5);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(5);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match &self.modal {
             Modal::Help => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
@@ -872,7 +1011,7 @@ impl App {
                 let name = self
                     .chains
                     .get(self.chain_idx)
-                    .map(|c| c.summary())
+                    .map(|c| format!("{} · on_fail={}\n{}",c.summary(),c.on_fail,c.steps.iter().map(Chain::step_label).collect::<Vec<_>>().join("\n")))
                     .unwrap_or_else(|| "(none)".into());
                 self.confirm(Action::RunChain, "Run task chain?", &name);
             }
@@ -912,10 +1051,10 @@ impl App {
                     Action::RunPlan,
                     "Run selected plan items?",
                     &format!(
-                        "{} selected / {} total  min_rank={}",
+                        "{} selected / {} total  min_rank={}\nListener {}:{} (Payload wizard settings)",
                         self.plan.iter().filter(|p| p.selected).count(),
                         self.plan.len(),
-                        self.min_rank.as_str()
+                        self.min_rank.as_str(), self.venom.lhost, self.venom.lport
                     ),
                 ),
                 WizardKind::CredReuse => self.confirm(
@@ -932,13 +1071,14 @@ impl App {
             Tab::Creds => self.confirm(
                 Action::CredReuse,
                 "Credential reuse?",
-                "Launch login scanners for selected creds.",
+                "Launch login scanners for stored credentials against open login services.",
             ),
             Tab::Console => {}
         }
     }
 
     fn confirm(&mut self, action: Action, title: &str, body: &str) {
+        self.help_scroll = 0;
         self.modal = Modal::Confirm {
             title: title.into(),
             body: body.into(),
@@ -948,6 +1088,13 @@ impl App {
 
     fn perform(&mut self, action: Action) {
         match action {
+            Action::ValidatePlan => self.validate_selected_plan(),
+            Action::CancelWorkflow => {
+                if let Some(id) = self.active_workflow.clone() {
+                    self.send(Cmd::CancelWorkflow(id));
+                    self.status = "cancelling workflow…".into();
+                }
+            }
             Action::Connect => self.connect(),
             Action::RunModule => self.run_selected_module(),
             Action::RunPlan => self.run_plan(),
@@ -1017,6 +1164,10 @@ impl App {
         let kind = self.module_kind.as_str().to_string();
         let mut opts = HashMap::new();
         if let Some(info) = &self.module_info {
+            if info.fullname != name || info.kind != kind {
+                self.status = "wait for the selected module options to load".into();
+                return;
+            }
             for o in &info.options {
                 if !o.value.is_empty() {
                     opts.insert(o.name.clone(), o.value.clone());
@@ -1027,15 +1178,37 @@ impl App {
         self.audit("module.execute", &format!("{kind}/{name}"));
         if self.demo {
             self.status = format!("[demo] would execute {kind}/{name}");
-            if let Some(t) = self.tasks.last_mut() {
+            if let Some(t) = self.tasks.first_mut() {
                 t.status = "demo".into();
             }
             return;
         }
-        self.send(Cmd::ExecuteModule { kind, name, opts });
+        self.start_workflow(
+            vec![Operation::Modules(vec![ModuleRun {
+                kind,
+                name,
+                options: opts,
+                check: false,
+            }])],
+            false,
+        );
     }
 
     fn rebuild_plan(&mut self) {
+        if !self.demo {
+            self.push_task("plan", "Framework module matching");
+            self.start_workflow(
+                vec![Operation::Plan {
+                    min_rank: self.min_rank,
+                    match_vulns: true,
+                    match_ports: true,
+                    execute: false,
+                    validate: false,
+                }],
+                false,
+            );
+            return;
+        }
         let catalog = crate::catalog::merge(&demo::modules());
         self.plan = match_plan::build_plan(&self.snap.hosts, &catalog, self.min_rank);
         self.plan_idx = 0;
@@ -1063,7 +1236,7 @@ impl App {
         );
         if self.demo {
             self.status = format!("[demo] would run {} plan items", selected.len());
-            if let Some(t) = self.tasks.last_mut() {
+            if let Some(t) = self.tasks.first_mut() {
                 t.status = "demo".into();
                 t.detail = selected
                     .iter()
@@ -1073,18 +1246,66 @@ impl App {
             }
             return;
         }
-        for p in selected {
-            let mut opts = HashMap::new();
-            opts.insert("RHOSTS".into(), p.host.clone());
-            if let Some(port) = p.rport {
-                opts.insert("RPORT".into(), port.to_string());
-            }
-            self.send(Cmd::ExecuteModule {
-                kind: p.kind,
-                name: p.module,
-                opts,
-            });
+        let items = selected
+            .into_iter()
+            .map(|p| {
+                let mut options = self.listener_options();
+                options.insert("RHOSTS".into(), p.host);
+                if let Some(port) = p.rport {
+                    options.insert("RPORT".into(), port.to_string());
+                }
+                ModuleRun {
+                    kind: p.kind,
+                    name: p.module,
+                    options,
+                    check: false,
+                }
+            })
+            .collect();
+        self.start_workflow(vec![Operation::Modules(items)], false);
+    }
+
+    fn validate_selected_plan(&mut self) {
+        let selected = self
+            .plan
+            .iter()
+            .filter(|p| p.selected)
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            self.status = "no plan items selected".into();
+            return;
         }
+        self.push_task(
+            "validation",
+            &format!("{} selected module checks", selected.len()),
+        );
+        let items = selected
+            .into_iter()
+            .map(|p| {
+                let mut options = HashMap::from([("RHOSTS".into(), p.host)]);
+                if let Some(port) = p.rport {
+                    options.insert("RPORT".into(), port.to_string());
+                }
+                ModuleRun {
+                    kind: p.kind,
+                    name: p.module,
+                    options,
+                    check: true,
+                }
+            })
+            .collect();
+        self.start_workflow(vec![Operation::Modules(items)], false);
+    }
+
+    pub async fn shutdown_rpc(&mut self) {
+        if let Some(tx) = self.cmd_tx.take() {
+            let (done, rx) = tokio::sync::oneshot::channel();
+            if tx.send(Cmd::Shutdown(done)).is_ok() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(6), rx).await;
+            }
+        }
+        self.on_tick().await;
     }
 
     fn run_chain(&mut self) {
@@ -1095,7 +1316,7 @@ impl App {
         self.audit("chain", &chain.name);
         if self.demo {
             self.status = format!("[demo] chain {}", chain.name);
-            if let Some(t) = self.tasks.last_mut() {
+            if let Some(t) = self.tasks.first_mut() {
                 t.status = "demo".into();
                 t.detail = chain
                     .steps
@@ -1106,40 +1327,13 @@ impl App {
             }
             return;
         }
-        for step in &chain.steps {
-            match step {
-                Step::Discover { rhosts, ports } => {
-                    self.send(Cmd::ConsoleDiscover {
-                        rhosts: rhosts.clone(),
-                        ports: ports.clone(),
-                    });
-                }
-                Step::Import { path } => self.send(Cmd::ImportData { path: path.clone() }),
-                Step::AutoExploit { min_rank, .. } => {
-                    if let Some(r) = Rank::parse(min_rank) {
-                        self.min_rank = r;
-                    }
-                    self.rebuild_plan();
-                    self.run_plan();
-                }
-                Step::CollectEvidence {
-                    r#macro: macro_name,
-                } => {
-                    self.run_macro_named(&macro_name);
-                }
-                Step::Report { .. } => {
-                    let _ = self.generate_report();
-                }
-                Step::Module {
-                    kind,
-                    name,
-                    options,
-                } => {
-                    self.send(Cmd::ExecuteModule {
-                        kind: kind.clone(),
-                        name: name.clone(),
-                        opts: options.clone(),
-                    });
+        match crate::workflow::chain_steps(&chain) {
+            Ok(steps) => self.start_workflow(steps, chain.on_fail == "continue"),
+            Err(error) => {
+                self.status = format!("invalid chain: {error:#}");
+                if let Some(task) = self.tasks.first_mut() {
+                    task.status = "failed".into();
+                    task.detail = self.status.clone();
                 }
             }
         }
@@ -1148,17 +1342,43 @@ impl App {
     fn run_wizard(&mut self) {
         match self.wizard {
             WizardKind::Pentest => {
-                self.discover();
-                self.rebuild_plan();
-                self.tab = Tab::Wizards;
-                self.wizard = WizardKind::AutoPlan;
-                self.status =
-                    "discovered (or queued). review auto-exploit plan, then Ctrl-G".into();
+                self.push_task("pentest", "discover then build review plan");
+                self.start_workflow(
+                    vec![
+                        Operation::Discover {
+                            targets: self.pentest_rhosts.clone(),
+                            ports: self.pentest_ports.clone(),
+                        },
+                        Operation::Plan {
+                            min_rank: self.min_rank,
+                            match_vulns: true,
+                            match_ports: true,
+                            execute: false,
+                            validate: false,
+                        },
+                    ],
+                    false,
+                );
             }
             WizardKind::Validate => {
-                self.import_scan();
-                self.rebuild_plan();
-                self.wizard = WizardKind::AutoPlan;
+                if self.import_path.trim().is_empty() {
+                    self.status = "choose an import file before validating".into();
+                    return;
+                }
+                self.push_task("validation", "import then run vulnerability checks");
+                self.start_workflow(
+                    vec![
+                        Operation::Import(self.import_path.clone()),
+                        Operation::Plan {
+                            min_rank: self.min_rank,
+                            match_vulns: true,
+                            match_ports: false,
+                            execute: false,
+                            validate: true,
+                        },
+                    ],
+                    false,
+                );
             }
             WizardKind::Evidence => self.run_macro_selected(),
             WizardKind::AutoPlan => self.rebuild_plan(),
@@ -1176,15 +1396,18 @@ impl App {
         self.audit("discover", &targets);
         if self.demo {
             self.status = "[demo] db_nmap not sent".into();
-            if let Some(t) = self.tasks.last_mut() {
+            if let Some(t) = self.tasks.first_mut() {
                 t.status = "demo".into();
             }
             return;
         }
-        self.send(Cmd::ConsoleDiscover {
-            rhosts: self.pentest_rhosts.clone(),
-            ports: self.pentest_ports.clone(),
-        });
+        self.start_workflow(
+            vec![Operation::Discover {
+                targets: self.pentest_rhosts.clone(),
+                ports: self.pentest_ports.clone(),
+            }],
+            false,
+        );
         self.tab = Tab::Console;
     }
 
@@ -1203,17 +1426,29 @@ impl App {
             self.status = format!("[demo] import {}", self.import_path);
             return;
         }
-        self.send(Cmd::ImportData {
-            path: self.import_path.clone(),
-        });
+        self.push_task("import", &path);
+        self.start_workflow(vec![Operation::Import(path)], false);
     }
 
     fn generate_report(&mut self) {
-        match crate::reports::render(
+        match crate::reports::render_full(
             &self.paths.reports,
             &self.snap,
             &self.audit,
+            &self
+                .tasks
+                .iter()
+                .filter(|t| t.workspace == self.snap.workspace)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &self
+                .validations
+                .iter()
+                .filter(|v| v.workspace == self.snap.workspace)
+                .cloned()
+                .collect::<Vec<_>>(),
             self.report_redact,
+            &["md".into(), "html".into(), "json".into()],
         ) {
             Ok(files) => {
                 self.last_report = files.dir.display().to_string();
@@ -1240,24 +1475,36 @@ impl App {
     }
 
     fn run_venom(&mut self) {
+        if self.active_workflow.is_some() {
+            self.status = "cancel or finish the active workflow first".into();
+            return;
+        }
+        if self.venom.outfile.trim().is_empty() {
+            self.status = "choose a payload output file before generating".into();
+            return;
+        }
         let preview = self.venom.preview();
         self.push_task("msfvenom", &preview);
         self.audit("msfvenom", &preview);
         if self.demo {
             self.status = format!("[demo] {preview}");
-            if let Some(t) = self.tasks.last_mut() {
+            if let Some(t) = self.tasks.first_mut() {
                 t.status = "demo".into();
             }
             return;
         }
-        let args = self.venom.argv();
-        tokio::spawn(async move {
-            let _ = tokio::process::Command::new(&args[0])
-                .args(&args[1..])
-                .status()
-                .await;
+        if self.cmd_tx.is_none() {
+            let (tx, rx) = rpc::start_worker(self.config.clone());
+            self.cmd_tx = Some(tx);
+            self.ev_rx = Some(rx);
+        }
+        let id = self.tasks[0].id.clone();
+        self.active_workflow = Some(id.clone());
+        self.send(Cmd::GeneratePayload {
+            id,
+            argv: self.venom.argv(),
         });
-        self.status = format!("spawned {preview}");
+        self.status = format!("generating {preview}");
     }
 
     fn cred_reuse(&mut self) {
@@ -1278,27 +1525,53 @@ impl App {
         for cred in &self.snap.creds {
             for host in &self.snap.hosts {
                 for svc in &host.services {
+                    if svc.state != "open" {
+                        continue;
+                    }
                     if let Some((_, _, module)) = scanners
                         .iter()
                         .find(|(name, port, _)| svc.name == *name || svc.port == *port)
                     {
+                        let kind = cred.kind.to_ascii_lowercase();
+                        let ntlm = kind.contains("ntlm")
+                            && cred.pass.split_once(':').is_some_and(|(lm, nt)| {
+                                lm.len() == 32
+                                    && nt.len() == 32
+                                    && lm.chars().chain(nt.chars()).all(|c| c.is_ascii_hexdigit())
+                            });
+                        let password =
+                            kind.is_empty() || kind == "password" || kind.ends_with("::password");
+                        if !password && !(*module == "scanner/smb/smb_login" && ntlm) {
+                            continue;
+                        }
                         let mut opts = HashMap::new();
                         opts.insert("RHOSTS".into(), host.address.clone());
                         opts.insert("RPORT".into(), svc.port.to_string());
-                        opts.insert("USERNAME".into(), cred.user.clone());
-                        opts.insert("PASSWORD".into(), cred.pass.clone());
+                        if *module == "scanner/smb/smb_login" {
+                            opts.insert("SMBUser".into(), cred.user.clone());
+                            opts.insert("SMBPass".into(), cred.pass.clone());
+                            if !cred.realm.is_empty() {
+                                opts.insert("SMBDomain".into(), cred.realm.clone());
+                            }
+                        } else {
+                            opts.insert("USERNAME".into(), cred.user.clone());
+                            opts.insert("PASSWORD".into(), cred.pass.clone());
+                        }
                         jobs.push((*module, opts));
                     }
                 }
             }
         }
-        for (module, opts) in jobs {
-            self.send(Cmd::ExecuteModule {
+        let items = jobs
+            .into_iter()
+            .map(|(module, options)| ModuleRun {
                 kind: "auxiliary".into(),
                 name: module.into(),
-                opts,
-            });
-        }
+                options,
+                check: false,
+            })
+            .collect();
+        self.start_workflow(vec![Operation::Modules(items)], false);
     }
 
     fn run_macro_selected(&mut self) {
@@ -1307,38 +1580,88 @@ impl App {
         }
     }
 
-    fn run_macro_named(&mut self, name: &str) {
-        if let Some(m) = self.macros.iter().find(|m| m.name == name).cloned() {
-            self.run_macro(&m);
-        }
-    }
-
     fn run_macro(&mut self, m: &Macro) {
-        let Some(sess) = self.snap.sessions.get(self.session_idx).cloned() else {
+        let Some(session) = self.snap.sessions.get(self.session_idx).cloned() else {
             self.status = "no session for evidence macro".into();
             return;
         };
-        self.push_task("macro", &m.name);
-        self.audit("macro", &format!("{} on session {}", m.name, sess.id));
-        if self.demo {
-            self.status = format!("[demo] macro {} on session {}", m.name, sess.id);
+        if !crate::workflow::platform_matches(&m.platform, &session.platform) {
+            self.status = format!(
+                "macro {} requires {}, session is {}",
+                m.name, m.platform, session.platform
+            );
             return;
         }
-        for step in &m.steps {
-            let mut opts = step.options.clone();
-            opts.insert("SESSION".into(), sess.id.clone());
-            let name = step.module.trim_start_matches("post/").to_string();
-            self.send(Cmd::ExecuteModule {
-                kind: "post".into(),
-                name,
-                opts,
-            });
+        self.push_task("macro", &m.name);
+        self.audit("macro", &format!("{} on session {}", m.name, session.id));
+        self.start_workflow(
+            vec![Operation::Evidence {
+                name: m.name.clone(),
+                session: Some(session.id),
+            }],
+            false,
+        );
+    }
+
+    fn listener_options(&self) -> HashMap<String, String> {
+        HashMap::from([
+            ("LHOST".into(), self.venom.lhost.clone()),
+            ("LPORT".into(), self.venom.lport.clone()),
+        ])
+    }
+
+    fn start_workflow(&mut self, steps: Vec<Operation>, continue_on_failure: bool) {
+        let Some(task) = self.tasks.first_mut() else {
+            return;
+        };
+        if self.demo {
+            task.status = "demo".into();
+            self.status = "[demo] workflow not executed".into();
+            return;
         }
+        if self.active_workflow.is_some() || !self.connected || self.cmd_tx.is_none() {
+            task.status = "failed".into();
+            task.detail = "another workflow is active or RPC is disconnected".into();
+            self.status = task.detail.clone();
+            return;
+        }
+        let id = task.id.clone();
+        self.active_workflow = Some(id.clone());
+        let request = Request {
+            id,
+            steps,
+            continue_on_failure,
+            workspace: self.snap.workspace.clone(),
+            macros: self.macros.clone(),
+            cache: self.paths.cache.join("module-catalog.json"),
+            reports: self.paths.reports.clone(),
+            audit: self.audit.clone(),
+            tasks: self
+                .tasks
+                .iter()
+                .filter(|t| t.workspace == self.snap.workspace)
+                .cloned()
+                .collect(),
+            validations: self
+                .validations
+                .iter()
+                .filter(|v| v.workspace == self.snap.workspace)
+                .cloned()
+                .collect(),
+            redact: self.report_redact,
+            local: self.config.is_loopback(),
+            listener: self.listener_options(),
+        };
+        self.send(Cmd::RunWorkflow(Box::new(request)));
+        self.status = "workflow started".into();
     }
 
     fn push_task(&mut self, kind: &str, summary: &str) {
-        self.tasks.insert(0, TaskLog::new(kind, summary));
+        let mut task = TaskLog::new(kind, summary);
+        task.workspace = self.snap.workspace.clone();
+        self.tasks.insert(0, task);
         self.task_idx = 0;
+        let _ = persist::save_private_json(&self.paths.data.join("tasks.json"), &self.tasks);
     }
 
     fn yank(&mut self) {
@@ -1403,6 +1726,20 @@ impl App {
                 _ => {}
             },
             Tab::Modules => match key.code {
+                KeyCode::Left | KeyCode::Right if self.focused_pane() == 0 => {
+                    let i = match self.module_kind {
+                        ModuleKind::Exploit => 0,
+                        ModuleKind::Auxiliary => 1,
+                        ModuleKind::Post => 2,
+                        ModuleKind::Payload => 3,
+                        ModuleKind::Encoder => 4,
+                    };
+                    self.navigation_selector(crate::navigation::step(
+                        i,
+                        5,
+                        if key.code == KeyCode::Right { 1 } else { -1 },
+                    ));
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     let n = self.current_modules().len();
                     move_idx(&mut self.module_idx, n, 1);
@@ -1420,7 +1757,13 @@ impl App {
                     self.fetch_selected_module();
                 }
                 KeyCode::Char('f') => self.toggle_favorite(),
-                KeyCode::Enter => self.edit_selected_option(),
+                KeyCode::Enter => {
+                    if self.focused_pane() == 0 {
+                        self.focus_pane(1)
+                    } else {
+                        self.edit_selected_option()
+                    }
+                }
                 KeyCode::Char('l') => {
                     let n = self
                         .module_info
@@ -1449,8 +1792,19 @@ impl App {
                     move_idx(&mut self.session_idx, n, -1);
                 }
                 KeyCode::Char('i') => {
-                    self.interact = true;
-                    self.status = "session interact  Enter send  Esc back".into();
+                    if let Some(session) = self.snap.sessions.get(self.session_idx).cloned() {
+                        self.interact = true;
+                        self.navigation.focus[3] = 1;
+                        self.status = "session interact  Enter send  Esc back".into();
+                        if !self.demo {
+                            self.send(Cmd::SessionRead {
+                                id: session.id,
+                                meterpreter: session.kind.contains("meterpreter"),
+                            });
+                        }
+                    } else {
+                        self.status = "no session to interact with".into();
+                    }
                 }
                 _ => {}
             },
@@ -1477,6 +1831,11 @@ impl App {
                 _ => {}
             },
             Tab::Tasks => match key.code {
+                KeyCode::Char('x') if self.active_workflow.is_some() => self.confirm(
+                    Action::CancelWorkflow,
+                    "Cancel active workflow?",
+                    "Stops its current Framework job and remaining steps.",
+                ),
                 KeyCode::Char('j') | KeyCode::Down => {
                     let n = self.tasks.len().max(self.snap.jobs.len());
                     move_idx(&mut self.task_idx, n, 1);
@@ -1527,28 +1886,19 @@ impl App {
                     self.wiz_field = self.wiz_field.saturating_sub(1);
                 }
             }
-            KeyCode::Char(' ') if self.wizard == WizardKind::AutoPlan => {
+            KeyCode::Char(' ') if self.wizard == WizardKind::AutoPlan && self.focused_pane()==1 => {
                 if let Some(p) = self.plan.get_mut(self.plan_idx) {
                     p.selected = !p.selected;
                 }
             }
+            KeyCode::Char('v') if self.wizard == WizardKind::AutoPlan => self.confirm(Action::ValidatePlan,"Check selected modules?","Runs module.check against the selected targets; results are recorded in Tasks and Reports."),
             KeyCode::Char('a') if self.wizard == WizardKind::AutoPlan => self.rebuild_plan(),
-            KeyCode::Char('+') => {
-                self.min_rank = match self.min_rank {
-                    Rank::Excellent => Rank::Great,
-                    Rank::Great => Rank::Good,
-                    Rank::Good => Rank::Normal,
-                    _ => Rank::Normal,
-                };
+            KeyCode::Char('+') if self.wizard==WizardKind::AutoPlan => {
+                self.min_rank=match self.min_rank {Rank::Manual=>Rank::Low,Rank::Low=>Rank::Average,Rank::Average=>Rank::Normal,Rank::Normal=>Rank::Good,Rank::Good=>Rank::Great,Rank::Great|Rank::Excellent=>Rank::Excellent};
                 self.rebuild_plan();
             }
-            KeyCode::Char('-') => {
-                self.min_rank = match self.min_rank {
-                    Rank::Normal => Rank::Good,
-                    Rank::Good => Rank::Great,
-                    Rank::Great => Rank::Excellent,
-                    other => other,
-                };
+            KeyCode::Char('-') if self.wizard==WizardKind::AutoPlan => {
+                self.min_rank=match self.min_rank {Rank::Manual|Rank::Low=>Rank::Manual,Rank::Average=>Rank::Low,Rank::Normal=>Rank::Average,Rank::Good=>Rank::Normal,Rank::Great=>Rank::Good,Rank::Excellent=>Rank::Great};
                 self.rebuild_plan();
             }
             KeyCode::Enter => self.edit_wizard_field(),
@@ -1659,10 +2009,189 @@ fn move_idx(idx: &mut usize, len: usize, d: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for folder in ["chains", "macros", "reports", "cache"] {
+            std::fs::create_dir(root.join(folder)).unwrap();
+        }
+        let paths = Paths {
+            data: root.into(),
+            config_dir: root.into(),
+            config: root.join("config.toml"),
+            audit: root.join("audit.jsonl"),
+            chains: root.join("chains"),
+            macros: root.join("macros"),
+            reports: root.join("reports"),
+            favorites: root.join("favorites.toml"),
+            cache: root.join("cache"),
+        };
+        let app = App::with_paths(true, paths).unwrap();
+        (dir, app)
+    }
 
     #[test]
+    fn validation_action_sends_checks_and_tracks_the_matching_task() {
+        let (_dir, mut app) = test_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.demo = false;
+        app.connected = true;
+        app.cmd_tx = Some(tx);
+        app.plan = vec![PlanItem {
+            host: "192.0.2.1".into(),
+            module: "linux/http/fixture".into(),
+            kind: "exploit".into(),
+            rank: "great".into(),
+            reason: "fixture".into(),
+            rport: Some(80),
+            selected: true,
+        }];
+        app.validate_selected_plan();
+        let id = app.active_workflow.clone().unwrap();
+        let Cmd::RunWorkflow(req) = rx.try_recv().unwrap() else {
+            panic!("expected workflow")
+        };
+        let Operation::Modules(items) = &req.steps[0] else {
+            panic!("expected checks")
+        };
+        assert!(items[0].check);
+        assert_eq!(items[0].options["RHOSTS"], "192.0.2.1");
+        app.push_task("new", "another task");
+        let new_id = app.tasks[0].id.clone();
+        app.on_event(Event::TaskUpdate {
+            id: id.clone(),
+            status: "complete".into(),
+            detail: "checked".into(),
+        });
+        app.on_event(Event::WorkflowFinished(id.clone()));
+        assert!(app.active_workflow.is_none());
+        assert_eq!(
+            app.tasks.iter().find(|t| t.id == id).unwrap().status,
+            "complete"
+        );
+        assert_eq!(
+            app.tasks.iter().find(|t| t.id == new_id).unwrap().status,
+            "running"
+        );
+    }
+    #[test]
+    fn plan_page_keys_and_cancel_confirmation_use_context() {
+        let (_dir, mut app) = test_app();
+        app.tab = Tab::Wizards;
+        app.wizard = WizardKind::AutoPlan;
+        app.rebuild_plan();
+        app.focus_pane(1);
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.plan_idx, 8.min(app.plan.len() - 1));
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.plan_idx, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.min_rank, Rank::Excellent);
+        app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(app.min_rank, Rank::Great);
+        app.active_workflow = Some("fixture".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            app.modal,
+            Modal::Confirm {
+                action: Action::CancelWorkflow,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn credential_reuse_skips_closed_ports_and_uses_framework_smb_options() {
+        let (_dir, mut app) = test_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.demo = false;
+        app.connected = true;
+        app.cmd_tx = Some(tx);
+        app.snap.creds = vec![Cred {
+            host: "192.0.2.1".into(),
+            service: "smb".into(),
+            user: "tester".into(),
+            pass: "fixture".into(),
+            kind: "password".into(),
+            realm: "LAB".into(),
+        }];
+        app.snap.hosts = vec![Host {
+            address: "192.0.2.1".into(),
+            services: vec![
+                Service {
+                    port: 445,
+                    proto: "tcp".into(),
+                    name: "smb".into(),
+                    state: "open".into(),
+                    info: String::new(),
+                },
+                Service {
+                    port: 22,
+                    proto: "tcp".into(),
+                    name: "ssh".into(),
+                    state: "closed".into(),
+                    info: String::new(),
+                },
+            ],
+            ..Default::default()
+        }];
+        app.cred_reuse();
+        match rx.try_recv().unwrap() {
+            Cmd::RunWorkflow(request) => {
+                let Operation::Modules(items) = &request.steps[0] else {
+                    panic!("expected modules")
+                };
+                assert_eq!(items.len(), 1);
+                let item = &items[0];
+                assert_eq!(item.name, "scanner/smb/smb_login");
+                assert_eq!(
+                    item.options.get("SMBUser").map(String::as_str),
+                    Some("tester")
+                );
+                assert_eq!(
+                    item.options.get("SMBDomain").map(String::as_str),
+                    Some("LAB")
+                );
+                assert!(!item.options.contains_key("USERNAME"));
+            }
+            _ => panic!("expected scanner command"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn unicode_console_trim_keeps_valid_utf8_and_console_idle_clears_busy() {
+        let (_dir, mut app) = test_app();
+        app.on_event(Event::Console {
+            data: format!("x{}", "🦀".repeat(30_000)),
+            busy: true,
+        });
+        assert!(app.console.len() <= 60_000);
+        assert!(app.console.contains("🦀"));
+        assert!(app.busy);
+        app.on_event(Event::Console {
+            data: String::new(),
+            busy: false,
+        });
+        assert!(!app.busy);
+    }
+    #[test]
+    fn demo_updates_the_new_task_not_an_older_one() {
+        let (_dir, mut app) = test_app();
+        app.push_task("old", "previous task");
+        let old = app.tasks[0].id.clone();
+        app.run_plan();
+        // Build a selected plan so this actually creates the second task.
+        app.rebuild_plan();
+        app.run_plan();
+        assert!(app.tasks.len() > 1);
+        assert_eq!(app.tasks[0].status, "demo");
+        assert_ne!(
+            app.tasks.iter().find(|t| t.id == old).unwrap().status,
+            "demo"
+        );
+    }
+    #[test]
     fn demo_builds_plan() {
-        let mut app = App::new(true).expect("demo app");
+        let (_dir, mut app) = test_app();
         app.rebuild_plan_for_test();
         assert!(
             app.plan.iter().any(|p| p.module.contains("eternalblue")),
@@ -1680,7 +2209,7 @@ impl App {
          6 Tasks  7 Chains  8 Reports   9 Console    0 Wizards\n\n\
          Ctrl-G  confirm primary action (connect / run / scan / report)\n\
          /       filter     y yank      r refresh     q quit     ? this help\n\
-         Tab     cycle pane / module type / wizard\n\
+         Tab/Shift-Tab screens   F6/Shift-F6 panes   F2 Navigate\n\
          j k     move       Enter edit  space toggle plan item\n\n\
          Hosts   i import path   a auto-exploit plan\n\
          Modules t type   f favorite   Enter option   l/h options\n\
@@ -1693,6 +2222,8 @@ impl App {
 }
 
 pub const ACTIONS: &[crate::commands::Action] = &[
+    crate::commands::Action::ctrl("Validate selected plan modules", 'v'),
+    crate::commands::Action::ctrl("Cancel active workflow", 'x'),
     crate::commands::Action::key("Dashboard", '1'),
     crate::commands::Action::key("Hosts", '2'),
     crate::commands::Action::key("Modules", '3'),
@@ -1700,7 +2231,10 @@ pub const ACTIONS: &[crate::commands::Action] = &[
     crate::commands::Action::ctrl("Review and run", 'g'),
     crate::commands::Action::key("Filter", '/'),
     crate::commands::Action::key("Help", '?'),
+    crate::commands::Action::theme("Crimson theme", 'c'),
     crate::commands::Action::theme("Aurora theme", 'a'),
     crate::commands::Action::theme("Follow Omarchy theme", 'o'),
     crate::commands::Action::theme("Terminal theme", 't'),
 ];
+
+include!("navigation_impl.rs");

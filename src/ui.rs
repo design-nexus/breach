@@ -1,44 +1,53 @@
 use crate::app::{App, CredPane, HostPane, Modal, Tab, WizardKind};
 use crate::chains::Chain;
+use crate::model::ModuleKind;
 use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    app.navigation.begin(frame.area());
     let area = frame.area();
     frame.render_widget(Block::default().style(theme::bg()), area);
 
-    if area.width < 30 || area.height < 10 {
+    if area.width < 30 || area.height < 14 {
         frame.render_widget(
-            Paragraph::new("breach · needs 30×10\nResize terminal; q quits"),
+            Paragraph::new("breach · needs 30×14\nResize terminal; q quits"),
             area,
         );
         return;
     }
+    let chrome = chrome();
+    let area = chrome.shell(frame, area);
+    let title_h = crate::aurora::title_height(area.height);
+    let nav_h = 3;
+    let context_h = if area.height >= 26 { 2 } else { 1 };
     let chunks = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Min(8),
-        Constraint::Length(2),
+        Constraint::Length(title_h + nav_h + context_h),
+        Constraint::Min(1),
+        Constraint::Length(if area.height >= 26 { 4 } else { 3 }),
     ])
     .split(area);
 
     draw_header(frame, app, chunks[0]);
+    let body = crate::aurora::body(chunks[1]);
     match app.tab {
-        Tab::Dash => draw_dash(frame, app, chunks[1]),
-        Tab::Hosts => draw_hosts(frame, app, chunks[1]),
-        Tab::Modules => draw_modules(frame, app, chunks[1]),
-        Tab::Sessions => draw_sessions(frame, app, chunks[1]),
-        Tab::Creds => draw_creds(frame, app, chunks[1]),
-        Tab::Tasks => draw_tasks(frame, app, chunks[1]),
-        Tab::Chains => draw_chains(frame, app, chunks[1]),
-        Tab::Reports => draw_reports(frame, app, chunks[1]),
-        Tab::Console => draw_console(frame, app, chunks[1]),
-        Tab::Wizards => draw_wizards(frame, app, chunks[1]),
+        Tab::Dash => draw_dash(frame, app, body),
+        Tab::Hosts => draw_hosts(frame, app, body),
+        Tab::Modules => draw_modules(frame, app, body),
+        Tab::Sessions => draw_sessions(frame, app, body),
+        Tab::Creds => draw_creds(frame, app, body),
+        Tab::Tasks => draw_tasks(frame, app, body),
+        Tab::Chains => draw_chains(frame, app, body),
+        Tab::Reports => draw_reports(frame, app, body),
+        Tab::Console => draw_console(frame, app, body),
+        Tab::Wizards => draw_wizards(frame, app, body),
     }
-    draw_status(frame, app, chunks[2]);
+    let footer = chrome.footer(frame, chunks[2]);
+    draw_status(frame, app, footer);
 
     if app.filtering {
         draw_prompt(frame, area, "filter", &app.edit.value, app.edit.cursor);
@@ -46,27 +55,47 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.modal {
         Modal::None => {}
         Modal::Help => draw_help(frame, area, app.help_scroll),
-        Modal::Confirm { title, body, .. } => draw_confirm(frame, area, title, body),
-        Modal::Message { title, body } => draw_confirm(frame, area, title, body),
+        Modal::Confirm { title, body, .. } => {
+            draw_confirm(frame, area, title, body, app.help_scroll)
+        }
+        Modal::Message { title, body } => draw_confirm(frame, area, title, body, app.help_scroll),
         Modal::Edit { title, .. } => {
             draw_prompt(frame, area, title, &app.edit.value, app.edit.cursor);
         }
     }
+    if matches!(app.modal, Modal::Confirm { .. }) {
+        let popup = centered(area, 70, 40);
+        app.navigation
+            .dialog_buttons(frame, popup, app.navigation_skin());
+    }
     app.commands.draw(
         frame,
-        crate::app::ACTIONS,
+        &app.command_actions(),
         theme::bg_color(),
         theme::fg(),
         theme::purple(),
-        theme::current(),
+        theme::selected().bg.unwrap_or(theme::current()),
     );
+    app.draw_navigation(frame);
+}
+
+fn chrome() -> crate::aurora::Chrome {
+    crate::aurora::Chrome {
+        base: theme::bg(),
+        muted: theme::muted(),
+        accent: theme::title(),
+        data: theme::ip(),
+        border: Style::default().fg(theme::comment()),
+        deep: Style::default().bg(theme::deep()).fg(theme::fg()),
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let height = frame.area().height.saturating_sub(2);
     let [identity, tabs, context] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Length(crate::aurora::title_height(height)),
+        Constraint::Length(3),
+        Constraint::Min(0),
     ])
     .areas(area);
     let state = if app.demo {
@@ -76,38 +105,30 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "○ RPC offline"
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" breach", theme::title()),
-            Span::styled("  Metasploit / workspace lab  ", theme::muted()),
-            Span::styled(state, theme::ok()),
-        ])),
+    chrome().title(
+        frame,
         identity,
+        "breach",
+        "Metasploit / workspace lab",
+        state,
+        if app.connected || app.demo {
+            theme::ok()
+        } else {
+            theme::err()
+        },
     );
-    let all = Tab::all();
-    let selected = all.iter().position(|t| *t == app.tab).unwrap_or(0);
-    let start = if area.width < 100 {
-        selected.saturating_sub(2)
-    } else {
-        0
-    };
-    let count = if area.width < 100 { 5 } else { 10 };
-    let titles: Vec<Line> = all
-        .iter()
-        .skip(start)
-        .take(count)
-        .map(|t| Line::from(t.title()))
-        .collect();
-    frame.render_widget(
-        Tabs::new(titles)
-            .select(selected - start)
-            .highlight_style(theme::accent())
-            .divider("  "),
-        tabs,
-    );
+    app.navigation_bar(frame, tabs);
+    let context = Block::default()
+        .padding(ratatui::widgets::Padding::horizontal(2))
+        .inner(context);
+    let [workspace, counts] = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(34.min(context.width / 2)),
+    ])
+    .areas(context);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" Workspace ", theme::muted()),
+            Span::styled("Workspace ", theme::muted()),
             Span::styled(
                 if app.snap.workspace.is_empty() {
                     "—"
@@ -116,17 +137,19 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 },
                 theme::ip(),
             ),
-            Span::styled(
-                format!(
-                    "   Hosts {}  Sessions {}  Jobs {}",
-                    app.snap.hosts.len(),
-                    app.snap.sessions.len(),
-                    app.snap.jobs.len()
-                ),
-                theme::muted(),
-            ),
         ])),
-        context,
+        workspace,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Hosts {}  Sessions {}  Jobs {}",
+            app.snap.hosts.len(),
+            app.snap.sessions.len(),
+            app.snap.jobs.len()
+        ))
+        .style(theme::muted())
+        .alignment(Alignment::Right),
+        counts,
     );
 }
 
@@ -134,7 +157,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let [keys, status] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
     frame.render_widget(
-        Paragraph::new(" Tab pane  / filter  ^K actions  q quit").style(theme::muted()),
+        Paragraph::new(crate::navigation::shortcuts(
+            &app.footer_hints(),
+            keys.width,
+            theme::title(),
+            theme::muted(),
+        ))
+        .style(chrome().deep),
         keys,
     );
     let area = status;
@@ -158,13 +187,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             theme::ip(),
         ),
         Span::styled(format!(" {} ", app.status), theme::muted()),
-        Span::styled("  Tab pane  / filter  ^K actions  q quit", theme::muted()),
     ]);
-    frame.render_widget(Paragraph::new(line).style(theme::bg()), area);
+    frame.render_widget(Paragraph::new(line).style(chrome().deep), area);
 }
 
 fn pane(title: &str, focused: bool) -> Block<'_> {
     Block::bordered()
+        .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(theme::pane_border(focused))
         .title(Span::styled(
             title,
@@ -177,8 +206,17 @@ fn pane(title: &str, focused: bool) -> Block<'_> {
 }
 
 fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
+    let cols = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
+        }
+    } else {
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area)
+    };
+    app.navigation.pane(cols[0], 0);
+    app.navigation.pane(cols[1], 1);
     let st = &app.snap.module_stats;
     let left = vec![
         Line::from(Span::styled("Connection", theme::title())),
@@ -229,7 +267,9 @@ fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
         )),
     ];
     frame.render_widget(
-        Paragraph::new(left).block(pane(" overview ", true)),
+        Paragraph::new(left)
+            .scroll((app.detail_scroll, 0))
+            .block(pane(" overview ", app.focused_pane() == 0)),
         cols[0],
     );
 
@@ -237,224 +277,439 @@ fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
     if app.audit.is_empty() {
         right.push(Line::from(Span::styled("  (empty)", theme::muted())));
     }
-    for e in app.audit.iter().rev().take(18) {
+    for e in app.audit.iter().rev() {
         right.push(Line::from(vec![
             Span::styled(format!("  {} ", ts_short(&e.ts)), theme::muted()),
             Span::styled(&e.action, theme::flag()),
             Span::styled(format!(" {}", truncate(&e.detail, 40)), theme::muted()),
         ]));
     }
-    frame.render_widget(Paragraph::new(right).block(pane(" audit ", false)), cols[1]);
+    frame.render_widget(
+        Paragraph::new(right)
+            .scroll((app.detail_scroll, 0))
+            .block(pane(" audit ", app.focused_pane() == 1)),
+        cols[1],
+    );
+    app.navigation.details(cols[1], 1);
 }
 
 fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = if area.width < 70 {
+    let [list_area, details] = if area.width < 70 {
         if app.host_pane == HostPane::List {
             [area, Rect::default()]
         } else {
             [Rect::default(), area]
         }
     } else {
-        Layout::horizontal([Constraint::Length(30), Constraint::Min(1)]).areas(area)
+        let [list, _gutter, detail] = Layout::horizontal([
+            Constraint::Length(if area.width >= 100 { 29 } else { 24 }),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .areas(area);
+        [list, detail]
     };
-    let ids = app.filtered_hosts();
-    let mut lines = Vec::new();
-    for (n, hi) in ids.iter().enumerate() {
-        let h = &app.snap.hosts[*hi];
-        let sel = *hi == app.host_idx;
-        let style = if sel && app.host_pane == HostPane::List {
-            theme::selected()
-        } else if sel {
-            theme::accent()
-        } else {
-            theme::bg()
-        };
-        let mark = if sel { "▸" } else { " " };
-        lines.push(Line::from(Span::styled(
-            format!("{mark} {}", h.address),
-            style,
+    app.navigation.pane(list_area, 0);
+    app.navigation.details(details, 1);
+    if !list_area.is_empty() {
+        let list_area = crate::aurora::sidebar(
+            frame,
+            list_area,
+            Style::default().fg(if app.host_pane == HostPane::List {
+                theme::purple()
+            } else {
+                theme::comment()
+            }),
+        );
+        let ids = app.filtered_hosts();
+        let spaced = list_area.height >= 18;
+        let row_h = if spaced { 3 } else { 2 };
+        let compact = list_area.height < 10;
+        let heading_h = if compact { 1 } else { 2 };
+        let gap_h = u16::from(!compact);
+        let note_h = if compact { 1 } else { 2 };
+        let list_h = (ids.len() as u16 * row_h)
+            .max(2)
+            .min(list_area.height.saturating_sub(heading_h + gap_h + note_h));
+        let [heading, list, _gap, note, _space] = Layout::vertical([
+            Constraint::Length(heading_h),
+            Constraint::Length(list_h),
+            Constraint::Length(gap_h),
+            Constraint::Length(note_h),
+            Constraint::Min(0),
+        ])
+        .areas(list_area);
+        frame.render_widget(Paragraph::new("Hosts").style(theme::title()), heading);
+        let mut items = Vec::new();
+        for hi in &ids {
+            let host = &app.snap.hosts[*hi];
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "{}{}",
+                        if *hi == app.host_idx { "▸ " } else { "  " },
+                        host.address
+                    ),
+                    if *hi == app.host_idx {
+                        theme::accent()
+                    } else {
+                        theme::bg()
+                    },
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "  {} · {} services",
+                        truncate(&host.os, 18),
+                        host.services.len()
+                    ),
+                    theme::muted(),
+                )),
+            ];
+            if spaced {
+                lines.push(Line::from(""));
+            }
+            items.push(ratatui::widgets::ListItem::new(lines));
+        }
+        if items.is_empty() {
+            items.push(ratatui::widgets::ListItem::new(
+                "No hosts. Import Nmap XML (i) or discover (Ctrl+G).",
+            ));
+        }
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(ids.iter().position(|i| *i == app.host_idx));
+        frame.render_stateful_widget(
+            ratatui::widgets::List::new(items).highlight_style(theme::selected()),
+            list,
+            &mut state,
+        );
+        app.navigation.rows(
+            list,
+            0,
+            state.offset(),
+            row_h,
+            ids.len().saturating_sub(state.offset()),
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("(/)", theme::accent()),
+                Span::styled(" filter hosts", theme::muted()),
+            ])),
+            note,
+        );
+    }
+
+    if details.is_empty() {
+        return;
+    }
+    let Some(host) = app.snap.hosts.get(app.host_idx) else {
+        frame.render_widget(
+            Paragraph::new("Select a host to inspect services and findings.").style(theme::muted()),
+            details,
+        );
+        return;
+    };
+    // Compose a real card into a scrollable buffer so the review panel and all
+    // service/finding/note data remain reachable in a small terminal.
+    use ratatui::widgets::Widget;
+    let width = details.width;
+    let inner_width = width.saturating_sub(4).max(1) as usize;
+    let notes: Vec<_> = app
+        .snap
+        .notes
+        .iter()
+        .filter(|n| n.host == host.address)
+        .collect();
+    let mut review = vec![
+        Line::from(Span::styled("Review plan", theme::title())),
+        Line::from(Span::styled(
+            format!("{} recorded findings", host.vulns.len()),
+            theme::bg(),
+        )),
+    ];
+    for finding in &host.vulns {
+        review.push(Line::from(Span::styled(
+            format!(
+                "{} [{}] {}",
+                finding.name,
+                finding.refs.join(", "),
+                finding.info
+            ),
+            theme::warn(),
         )));
-        lines.push(Line::from(Span::styled(
-            format!("  {} · {} services", truncate(&h.os, 16), h.services.len()),
+    }
+    review.push(Line::from(Span::styled(
+        "Inspect evidence and module matches before execution.",
+        theme::muted(),
+    )));
+    review.push(Line::from(vec![
+        Span::styled("(a)", theme::accent()),
+        Span::styled(" Build review plan", theme::bg()),
+    ]));
+    let review_h = review
+        .iter()
+        .map(|line| line.width().div_ceil(inner_width).max(1))
+        .sum::<usize>() as u16
+        + 2;
+    let service_rows = if details.height >= 22 { 2 } else { 1 };
+    let services_h = 2 + host.services.len() as u16 * service_rows;
+    let notes_h = if notes.is_empty() {
+        0
+    } else {
+        3 + notes
+            .iter()
+            .map(|n| {
+                (n.ntype.len() + n.data.len() + 1)
+                    .div_ceil(width.max(1) as usize)
+                    .max(1)
+            })
+            .sum::<usize>() as u16
+    };
+    let meta_h = 3;
+    let height = meta_h + services_h + 1 + review_h + notes_h;
+    let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+    Block::default()
+        .style(theme::bg())
+        .render(buffer.area, &mut buffer);
+    let [metadata, services, _gap, card, notes_area] = Layout::vertical([
+        Constraint::Length(meta_h),
+        Constraint::Length(services_h),
+        Constraint::Length(1),
+        Constraint::Length(review_h),
+        Constraint::Length(notes_h),
+    ])
+    .areas(buffer.area);
+    let [name, alive] = Layout::horizontal([Constraint::Min(1), Constraint::Length(11)])
+        .areas(Rect::new(0, 0, width, 1));
+    Paragraph::new(host.address.as_str())
+        .style(theme::title())
+        .render(name, &mut buffer);
+    let up = host.services.iter().any(|service| service.state == "open");
+    Paragraph::new(if up { "● alive" } else { "○ inactive" })
+        .style(if up { theme::ok() } else { theme::muted() })
+        .alignment(Alignment::Right)
+        .render(alive, &mut buffer);
+    let meta = vec![Line::from(vec![
+        Span::styled(host.os.as_str(), theme::hostname()),
+        Span::styled(
+            format!(" · {} · {} · {}", host.name, host.purpose, host.info),
             theme::muted(),
-        )));
-        if n > 40 {
-            break;
+        ),
+    ])];
+    Paragraph::new(meta).wrap(Wrap { trim: false }).render(
+        Rect::new(0, 1, width, metadata.height.saturating_sub(1)),
+        &mut buffer,
+    );
+    let mut service_lines = vec![
+        Line::from(Span::styled("Services", theme::title())),
+        Line::from(""),
+    ];
+    for service in &host.services {
+        service_lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:<12}", format!("{}/{}", service.port, service.proto)),
+                theme::ip(),
+            ),
+            Span::styled(
+                format!("{:<14}", service.name),
+                if service.state == "open" {
+                    theme::bg()
+                } else {
+                    theme::muted()
+                },
+            ),
+            Span::styled(
+                format!(
+                    "{}{}",
+                    service.info,
+                    if service.state == "open" {
+                        String::new()
+                    } else {
+                        format!(" · {}", service.state)
+                    }
+                ),
+                theme::muted(),
+            ),
+        ]));
+        if service_rows == 2 {
+            service_lines.push(Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default().fg(theme::comment()),
+            )));
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no hosts — import nmap XML (i) or discover (Ctrl-G)",
-            theme::muted(),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((
-                (ids.iter().position(|i| *i == app.host_idx).unwrap_or(0) * 2)
-                    .saturating_sub(cols[0].height.saturating_sub(4) as usize)
-                    as u16,
-                0,
-            ))
-            .block(pane(
-                " hosts  a plan  i import ",
-                app.host_pane == HostPane::List,
-            )),
-        cols[0],
-    );
-
-    let mut detail = Vec::new();
-    if let Some(h) = app.snap.hosts.get(app.host_idx) {
-        detail.push(Line::from(Span::styled(
-            format!("{}  {}", h.address, h.name),
-            theme::ip(),
-        )));
-        detail.push(Line::from(Span::styled(&h.os, theme::hostname())));
-        if !h.purpose.is_empty() || !h.info.is_empty() {
-            detail.push(Line::from(Span::styled(
-                format!("{}  {}", h.purpose, h.info),
+    Paragraph::new(service_lines)
+        .wrap(Wrap { trim: false })
+        .render(services, &mut buffer);
+    let block = Block::bordered()
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(if app.host_pane == HostPane::Detail {
+            theme::purple()
+        } else {
+            theme::comment()
+        }))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    let inner = block.inner(card);
+    block.render(card, &mut buffer);
+    Paragraph::new(review)
+        .wrap(Wrap { trim: false })
+        .render(inner, &mut buffer);
+    if !notes.is_empty() {
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled("Notes", theme::title())),
+            Line::from(""),
+        ];
+        for note in notes {
+            lines.push(Line::from(Span::styled(
+                format!("{} {}", note.ntype, note.data),
                 theme::muted(),
             )));
         }
-        detail.push(Line::from(""));
-        detail.push(Line::from(Span::styled("services", theme::title())));
-        for s in &h.services {
-            let st = if s.state == "open" {
-                theme::ok()
-            } else {
-                theme::muted()
-            };
-            detail.push(Line::from(Span::styled(
-                format!("  {:>5}/{:<4} {:<12} {}", s.port, s.proto, s.name, s.info),
-                st,
-            )));
-        }
-        detail.push(Line::from(""));
-        detail.push(Line::from(Span::styled(
-            "Review plan · recorded findings",
-            theme::title(),
-        )));
-        if h.vulns.is_empty() {
-            detail.push(Line::from(Span::styled("  (none)", theme::muted())));
-        }
-        for v in &h.vulns {
-            detail.push(Line::from(Span::styled(
-                format!("  {} [{}] {}", v.name, v.refs.join(", "), v.info),
-                theme::warn(),
-            )));
-        }
-        let notes: Vec<_> = app
-            .snap
-            .notes
-            .iter()
-            .filter(|n| n.host == h.address)
-            .collect();
-        if !notes.is_empty() {
-            detail.push(Line::from(""));
-            detail.push(Line::from(Span::styled("notes", theme::title())));
-            for n in notes {
-                detail.push(Line::from(Span::styled(
-                    format!("  {} {}", n.ntype, n.data),
-                    theme::muted(),
-                )));
-            }
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(notes_area, &mut buffer);
+    }
+    let scroll = app.detail_scroll.min(height.saturating_sub(details.height));
+    for y in 0..details.height.min(height.saturating_sub(scroll)) {
+        for x in 0..width {
+            frame.buffer_mut()[(details.x + x, details.y + y)] = buffer[(x, y + scroll)].clone();
         }
     }
-    frame.render_widget(
-        Paragraph::new(detail)
-            .wrap(Wrap { trim: false })
-            .scroll((app.detail_scroll, 0))
-            .block(pane(" detail ", app.host_pane == HostPane::Detail)),
-        cols[1],
-    );
 }
 
 fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).split(area);
-    let names = app.current_modules();
-    let mut lines = vec![Line::from(Span::styled(
-        format!(
-            "type={}  {} shown  t cycle  f favorite",
-            app.module_kind.as_str(),
-            names.len()
-        ),
-        theme::muted(),
-    ))];
-    for (i, n) in names.iter().enumerate() {
-        let sel = i == app.module_idx;
-        let star = if app.is_favorite(n) { "*" } else { " " };
-        let style = if sel { theme::selected() } else { theme::bg() };
-        let mark = if sel { "▸" } else { " " };
-        lines.push(Line::from(Span::styled(format!("{mark}{star} {n}"), style)));
-        if lines.len() > 40 {
-            break;
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(lines).block(pane(" modules ", true)),
-        cols[0],
-    );
-
-    let mut info_lines = Vec::new();
-    if let Some(m) = &app.module_info {
-        info_lines.push(Line::from(Span::styled(
-            format!("{}/{}", m.kind, m.fullname),
-            theme::title(),
-        )));
-        info_lines.push(Line::from(Span::styled(&m.name, theme::script())));
-        info_lines.push(Line::from(vec![
-            Span::styled("rank ", theme::muted()),
-            Span::styled(&m.rank, theme::rank_style(&m.rank)),
-        ]));
-        if !m.refs.is_empty() {
-            info_lines.push(Line::from(Span::styled(
-                format!("refs {}", m.refs.join(" ")),
-                theme::script(),
-            )));
-        }
-        info_lines.push(Line::from(""));
-        for (i, para) in wrap_desc(&m.description, 52).into_iter().enumerate() {
-            if i > 6 {
-                break;
-            }
-            info_lines.push(Line::from(Span::styled(para, theme::muted())));
-        }
-        info_lines.push(Line::from(""));
-        info_lines.push(Line::from(Span::styled(
-            "options  Enter edit  Ctrl-G execute",
-            theme::muted(),
-        )));
-        for (i, o) in m.options.iter().enumerate() {
-            let sel = i == app.option_idx;
-            let req = if o.required { "*" } else { " " };
-            let style = if sel { theme::selected() } else { theme::bg() };
-            info_lines.push(Line::from(Span::styled(
-                format!(
-                    "{req}{:<12} {:<16} ({}){} def={}",
-                    o.name,
-                    o.value,
-                    o.opt_type,
-                    if o.advanced { " adv" } else { "" },
-                    o.default
-                ),
-                style,
-            )));
+    let cols = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
         }
     } else {
-        info_lines.push(Line::from(Span::styled("select a module", theme::muted())));
+        Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).areas(area)
+    };
+    app.navigation.pane(cols[0], 0);
+    app.navigation.pane(cols[1], 1);
+    if !cols[0].is_empty() {
+        let block = pane(" Modules · (t) type ", app.focused_pane() == 0);
+        let inner = block.inner(cols[0]);
+        frame.render_widget(block, cols[0]);
+        let [selector, list] =
+            Layout::vertical([Constraint::Length(2.min(inner.height)), Constraint::Min(0)])
+                .areas(inner);
+        let types = [
+            ("Exploit", ModuleKind::Exploit),
+            ("Auxiliary", ModuleKind::Auxiliary),
+            ("Post", ModuleKind::Post),
+            ("Payload", ModuleKind::Payload),
+            ("Encoder", ModuleKind::Encoder),
+        ];
+        let current = types
+            .iter()
+            .position(|(_, k)| *k == app.module_kind)
+            .unwrap_or(0);
+        let text = format!(
+            "‹ {} › · {} modules",
+            types[current].0,
+            app.current_modules().len()
+        );
+        frame.render_widget(Paragraph::new(text).style(theme::title()), selector);
+        app.navigation.hit(
+            selector,
+            crate::navigation::Intent::Command("Module type picker"),
+        );
+        let items = app
+            .current_modules()
+            .iter()
+            .map(|n| {
+                ListItem::new(format!(
+                    "{} {}",
+                    if app.is_favorite(n) { "★" } else { " " },
+                    n
+                ))
+            })
+            .collect();
+        app.navigation
+            .list(frame, list, 0, items, app.module_idx, app.navigation_skin());
     }
-    frame.render_widget(
-        Paragraph::new(info_lines)
-            .block(pane(" info ", false))
-            .wrap(Wrap { trim: true }),
-        cols[1],
+    if cols[1].is_empty() {
+        return;
+    }
+    let block = pane(
+        " Options / details · (Enter) edit ",
+        app.focused_pane() == 1,
     );
+    let inner = block.inner(cols[1]);
+    frame.render_widget(block, cols[1]);
+    let [info, options] =
+        Layout::vertical([Constraint::Percentage(45), Constraint::Min(3)]).areas(inner);
+    app.navigation.details(info, 1);
+    if let Some(module) = &app.module_info {
+        let details = format!(
+            "{}/{}\n{} · rank {}\n{}\n\n{}",
+            module.kind,
+            module.fullname,
+            module.name,
+            module.rank,
+            module.refs.join(" "),
+            module.description
+        );
+        frame.render_widget(
+            Paragraph::new(details)
+                .wrap(Wrap { trim: false })
+                .scroll((app.detail_scroll, 0))
+                .style(theme::muted()),
+            info,
+        );
+        let items = module
+            .options
+            .iter()
+            .map(|o| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{}{} ", if o.required { "*" } else { " " }, o.name),
+                        theme::title(),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{} ({}){} def={}",
+                            o.value,
+                            o.opt_type,
+                            if o.advanced { " adv" } else { "" },
+                            o.default
+                        ),
+                        theme::bg(),
+                    ),
+                ]))
+            })
+            .collect();
+        app.navigation.list(
+            frame,
+            options,
+            1,
+            items,
+            app.option_idx,
+            app.navigation_skin(),
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new("Select a module to view its options").style(theme::muted()),
+            info,
+        );
+    }
 }
 
 fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
-    let rows =
-        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
+    let rows = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
+        }
+    } else {
+        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area)
+    };
+    app.navigation.pane(rows[0], 0);
+    app.navigation.pane(rows[1], 1);
     let mut lines = Vec::new();
     for (i, s) in app.snap.sessions.iter().enumerate() {
         let sel = i == app.session_idx;
@@ -488,9 +743,25 @@ fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
     if lines.is_empty() {
         lines.push(Line::from(Span::styled("no sessions", theme::muted())));
     }
-    frame.render_widget(
-        Paragraph::new(lines).block(pane(" sessions  i interact  Ctrl-G stop ", true)),
-        rows[0],
+    let block = pane(" Sessions · (Enter) interact ", app.focused_pane() == 0);
+    let inner = block.inner(rows[0]);
+    frame.render_widget(block, rows[0]);
+    let items = lines
+        .chunks(2)
+        .map(|rows| ListItem::new(rows.to_vec()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(app.session_idx));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(theme::selected()),
+        inner,
+        &mut state,
+    );
+    app.navigation.rows(
+        inner,
+        0,
+        state.offset(),
+        2,
+        app.snap.sessions.len().saturating_sub(state.offset()),
     );
 
     let sid = app
@@ -517,14 +788,25 @@ fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     frame.render_widget(
-        Paragraph::new(body).block(pane(" interact ", app.interact)),
+        Paragraph::new(body).block(pane(" interact ", app.focused_pane() == 1)),
         rows[1],
     );
+
+    app.navigation.details(rows[1], 1);
 }
 
 fn draw_creds(frame: &mut Frame, app: &App, area: Rect) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    let cols = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
+        }
+    } else {
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area)
+    };
+    app.navigation.pane(cols[0], 0);
+    app.navigation.pane(cols[1], 1);
     let mut cl = vec![Line::from(Span::styled(
         format!("redact={}  x toggle  Ctrl-G reuse", app.report_redact),
         theme::muted(),
@@ -553,9 +835,21 @@ fn draw_creds(frame: &mut Frame, app: &App, area: Rect) {
     if app.snap.creds.is_empty() {
         cl.push(Line::from(Span::styled("no credentials", theme::muted())));
     }
-    frame.render_widget(
-        Paragraph::new(cl).block(pane(" credentials ", app.cred_pane == CredPane::Creds)),
-        cols[0],
+    let block = pane(
+        " Credentials · (x) redact · (Ctrl+G) reuse ",
+        app.focused_pane() == 0,
+    );
+    let inner = block.inner(cols[0]);
+    frame.render_widget(block, cols[0]);
+    let [head, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(cl.remove(0)), head);
+    app.navigation.list(
+        frame,
+        list,
+        0,
+        cl.into_iter().map(ListItem::new).collect(),
+        app.cred_idx,
+        app.navigation_skin(),
     );
 
     let mut ll = Vec::new();
@@ -577,69 +871,93 @@ fn draw_creds(frame: &mut Frame, app: &App, area: Rect) {
     if ll.is_empty() {
         ll.push(Line::from(Span::styled("no loot", theme::muted())));
     }
-    frame.render_widget(
-        Paragraph::new(ll).block(pane(" loot ", app.cred_pane == CredPane::Loot)),
-        cols[1],
+    let block = pane(" Loot ", app.focused_pane() == 1);
+    let inner = block.inner(cols[1]);
+    frame.render_widget(block, cols[1]);
+    app.navigation.list(
+        frame,
+        inner,
+        1,
+        ll.into_iter().map(ListItem::new).collect(),
+        app.loot_idx,
+        app.navigation_skin(),
     );
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
-    let mut jobs = Vec::new();
-    for (i, j) in app.snap.jobs.iter().enumerate() {
-        let sel = i == app.job_idx;
-        jobs.push(Line::from(Span::styled(
-            format!("{} {:>3} {}", if sel { "▸" } else { " " }, j.id, j.name),
-            if sel { theme::selected() } else { theme::bg() },
-        )));
-    }
-    if jobs.is_empty() {
-        jobs.push(Line::from(Span::styled("no jobs", theme::muted())));
-    }
-    frame.render_widget(
-        Paragraph::new(jobs).block(pane(" jobs  Ctrl-G stop ", true)),
-        cols[0],
-    );
-
-    let mut tasks = Vec::new();
-    for (i, t) in app.tasks.iter().enumerate() {
-        let sel = i == app.task_idx;
-        tasks.push(Line::from(Span::styled(
-            format!(
-                "{} {} {:<10} {:<8} {}",
-                if sel { "▸" } else { " " },
-                t.started,
-                t.kind,
-                t.status,
-                truncate(&t.summary, 36)
-            ),
-            if sel { theme::selected() } else { theme::bg() },
-        )));
-        if !t.detail.is_empty() && sel {
-            for line in t.detail.lines().take(8) {
-                tasks.push(Line::from(Span::styled(
-                    format!("    {line}"),
-                    theme::muted(),
-                )));
-            }
+    let cols = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
         }
+    } else {
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area)
+    };
+    app.navigation.pane(cols[0], 0);
+    app.navigation.pane(cols[1], 1);
+    if !cols[0].is_empty() {
+        let block = pane(" Jobs · (Ctrl+G) stop ", app.focused_pane() == 0);
+        let inner = block.inner(cols[0]);
+        frame.render_widget(block, cols[0]);
+        let items = app
+            .snap
+            .jobs
+            .iter()
+            .map(|j| ListItem::new(format!("{} {}", j.id, j.name)))
+            .collect();
+        app.navigation
+            .list(frame, inner, 0, items, app.job_idx, app.navigation_skin());
     }
-    if tasks.is_empty() {
-        tasks.push(Line::from(Span::styled(
-            "no local tasks yet",
-            theme::muted(),
-        )));
+    if !cols[1].is_empty() {
+        let block = pane(" Task log · (Ctrl+X) cancel ", app.focused_pane() == 1);
+        let inner = block.inner(cols[1]);
+        frame.render_widget(block, cols[1]);
+        let [list, detail] = Layout::vertical([
+            Constraint::Length((inner.height / 3).max(1)),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+        let items = app
+            .tasks
+            .iter()
+            .map(|t| {
+                ListItem::new(format!(
+                    "{} {} · {} · {}",
+                    t.started, t.kind, t.status, t.summary
+                ))
+            })
+            .collect();
+        app.navigation
+            .list(frame, list, 1, items, app.task_idx, app.navigation_skin());
+        app.navigation.details(detail, 1);
+        let text = app
+            .tasks
+            .get(app.task_idx)
+            .map(|t| format!("{} · {}\n{}\n{}", t.kind, t.status, t.summary, t.detail))
+            .unwrap_or_else(|| "No local tasks yet".into());
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.detail_scroll, 0))
+                .style(theme::muted()),
+            detail,
+        );
     }
-    frame.render_widget(
-        Paragraph::new(tasks).block(pane(" task log ", false)),
-        cols[1],
-    );
 }
 
 fn draw_chains(frame: &mut Frame, app: &App, area: Rect) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
+    let cols = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
+        }
+    } else {
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area)
+    };
+    app.navigation.pane(cols[0], 0);
+    app.navigation.pane(cols[1], 1);
     let mut list = Vec::new();
     for (i, c) in app.chains.iter().enumerate() {
         let sel = i == app.chain_idx;
@@ -651,9 +969,16 @@ fn draw_chains(frame: &mut Frame, app: &App, area: Rect) {
     if list.is_empty() {
         list.push(Line::from(Span::styled("no chains", theme::muted())));
     }
-    frame.render_widget(
-        Paragraph::new(list).block(pane(" chains  Ctrl-G run ", true)),
-        cols[0],
+    let block = pane(" Chains · (Ctrl+G) review/run ", app.focused_pane() == 0);
+    let inner = block.inner(cols[0]);
+    frame.render_widget(block, cols[0]);
+    app.navigation.list(
+        frame,
+        inner,
+        0,
+        list.into_iter().map(ListItem::new).collect(),
+        app.chain_idx,
+        app.navigation_skin(),
     );
     let mut steps = Vec::new();
     if let Some(c) = app.chains.get(app.chain_idx) {
@@ -668,10 +993,21 @@ fn draw_chains(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     }
-    frame.render_widget(Paragraph::new(steps).block(pane(" steps ", false)), cols[1]);
+    frame.render_widget(
+        Paragraph::new(steps)
+            .block(pane(
+                " steps · (PgUp/PgDn) scroll ",
+                app.focused_pane() == 1,
+            ))
+            .scroll((app.detail_scroll, 0)),
+        cols[1],
+    );
+
+    app.navigation.details(cols[1], 1);
 }
 
 fn draw_reports(frame: &mut Frame, app: &App, area: Rect) {
+    app.navigation.details(area, 0);
     let lines = vec![
         Line::from(Span::styled("Workspace report", theme::title())),
         Line::from(""),
@@ -703,18 +1039,25 @@ fn draw_reports(frame: &mut Frame, app: &App, area: Rect) {
             theme::ok(),
         )),
     ];
-    frame.render_widget(Paragraph::new(lines).block(pane(" reports ", true)), area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((app.detail_scroll, 0))
+            .block(pane(" reports ", true)),
+        area,
+    );
 }
 
 fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).split(area);
+    app.navigation.pane(rows[0], 0);
+    app.navigation.pane(rows[1], 1);
     let tail = tail_lines(&app.console, (rows[0].height.saturating_sub(2)) as usize);
     let body: Vec<Line> = tail
         .iter()
         .map(|l| Line::from(Span::styled(l.as_str(), theme::ok())))
         .collect();
     frame.render_widget(
-        Paragraph::new(body).block(pane(" msfconsole ", true)),
+        Paragraph::new(body).block(pane(" msfconsole ", app.focused_pane() == 0)),
         rows[0],
     );
     let prompt = Paragraph::new(Line::from(vec![
@@ -722,12 +1065,26 @@ fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(&app.console_in.value, theme::flag()),
         Span::styled("█", theme::accent()),
     ]))
-    .block(pane(" input  Enter send  Esc dash ", true));
+    .block(pane(
+        " input  Enter send  Esc dash ",
+        app.focused_pane() == 1,
+    ));
     frame.render_widget(prompt, rows[1]);
+    app.navigation.details(rows[0], 0);
 }
 
 fn draw_wizards(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).split(area);
+    let cols = if area.width < 80 {
+        if app.focused_pane() == 0 {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
+        }
+    } else {
+        Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).areas(area)
+    };
+    app.navigation.pane(cols[0], 0);
+    app.navigation.pane(cols[1], 1);
     let mut list = Vec::new();
     for (i, w) in WizardKind::all().into_iter().enumerate() {
         let sel = w == app.wizard;
@@ -737,11 +1094,131 @@ fn draw_wizards(frame: &mut Frame, app: &App, area: Rect) {
         )));
         let _ = i;
     }
-    frame.render_widget(
-        Paragraph::new(list).block(pane(" wizards  Tab ", true)),
-        cols[0],
+    let block = pane(" Wizards · (Enter) open ", app.focused_pane() == 0);
+    let inner = block.inner(cols[0]);
+    frame.render_widget(block, cols[0]);
+    let selected = WizardKind::all()
+        .iter()
+        .position(|w| *w == app.wizard)
+        .unwrap_or(0);
+    app.navigation.list(
+        frame,
+        inner,
+        0,
+        list.into_iter().map(ListItem::new).collect(),
+        selected,
+        app.navigation_skin(),
     );
-
+    if cols[1].is_empty() {
+        return;
+    }
+    if app.wizard == WizardKind::AutoPlan {
+        let block = pane(
+            " review plan · (v) check · (Ctrl-G) execute ",
+            app.focused_pane() == 1,
+        );
+        let inner = block.inner(cols[1]);
+        frame.render_widget(block, cols[1]);
+        let [header, list] = Layout::vertical([
+            Constraint::Length(if inner.height >= 8 { 3 } else { 1 }),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!(
+                        "Auto-exploit plan · min {} · {} matches",
+                        app.min_rank.as_str(),
+                        app.plan.len()
+                    ),
+                    theme::title(),
+                )),
+                Line::from(Span::styled(
+                    "(space) select · (a) rebuild · (+/-) rank",
+                    theme::muted(),
+                )),
+                Line::from(Span::styled(
+                    "Review matches before executing or checking.",
+                    theme::muted(),
+                )),
+            ]),
+            header,
+        );
+        let width = list.width.saturating_sub(2).max(1) as usize;
+        let items = app
+            .plan
+            .iter()
+            .map(|p| {
+                let text = format!(
+                    "{} {} {} {}\n{}",
+                    if p.selected { "[x]" } else { "[ ]" },
+                    p.host,
+                    p.rank,
+                    p.module,
+                    p.reason
+                );
+                let mut lines = Vec::new();
+                for row in text.lines() {
+                    let mut line = String::new();
+                    let mut used = 0;
+                    for ch in row.chars() {
+                        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if used + cw > width && !line.is_empty() {
+                            lines.push(Line::from(std::mem::take(&mut line)));
+                            used = 0;
+                        }
+                        line.push(ch);
+                        used += cw;
+                    }
+                    lines.push(Line::from(line));
+                }
+                ListItem::new(lines).style(if p.selected {
+                    theme::ok()
+                } else {
+                    theme::muted()
+                })
+            })
+            .collect::<Vec<_>>();
+        let heights = items.iter().map(ListItem::height).collect::<Vec<_>>();
+        if items.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No matches. Import hosts or (a) rebuild.").style(theme::muted()),
+                list,
+            );
+        } else {
+            let mut state =
+                ListState::default().with_selected(Some(app.plan_idx.min(items.len() - 1)));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .highlight_style(theme::selected())
+                    .highlight_symbol("▸ "),
+                list,
+                &mut state,
+            );
+            let offset = state.offset();
+            let mut y = list.y;
+            for (i, height) in heights.iter().enumerate().skip(offset) {
+                if y >= list.bottom() {
+                    break;
+                }
+                let height = (*height as u16).min(list.bottom() - y);
+                app.navigation.hit(
+                    Rect::new(list.x, y, list.width, height),
+                    crate::navigation::Intent::Row(1, i),
+                );
+                y += height;
+            }
+        }
+        return;
+    }
+    app.navigation.rows(
+        cols[0].inner(ratatui::layout::Margin::new(1, 1)),
+        0,
+        0,
+        1,
+        WizardKind::all().len(),
+    );
     let right = match app.wizard {
         WizardKind::Pentest => vec![
             Line::from(Span::styled("Quick pentest", theme::title())),
@@ -755,17 +1232,40 @@ fn draw_wizards(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(Span::styled("Enter edit  Ctrl-G start", theme::muted())),
         ],
-        WizardKind::Validate => vec![
-            Line::from(Span::styled("Vulnerability validation", theme::title())),
-            Line::from(Span::styled(
-                "Import a scan, match modules by CVE/service, review plan.",
-                theme::muted(),
-            )),
-            Line::from(""),
-            field(0, app.wiz_field, "import", &app.import_path),
-            Line::from(""),
-            Line::from(Span::styled("Ctrl-G import + build plan", theme::muted())),
-        ],
+        WizardKind::Validate => {
+            let mut lines = vec![
+                Line::from(Span::styled("Vulnerability validation", theme::title())),
+                Line::from(Span::styled(
+                    "Import vulnerabilities, match CVEs, run supported module checks.",
+                    theme::muted(),
+                )),
+                Line::from(""),
+                field(0, app.wiz_field, "import", &app.import_path),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "(Ctrl-G) import + validate · results saved in Reports",
+                    theme::muted(),
+                )),
+            ];
+            for result in app
+                .validations
+                .iter()
+                .filter(|v| v.workspace == app.snap.workspace)
+            {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {} · {} · {}",
+                        result.host, result.module, result.code, result.message
+                    ),
+                    if result.code == "vulnerable" {
+                        theme::err()
+                    } else {
+                        theme::muted()
+                    },
+                )));
+            }
+            lines
+        }
         WizardKind::CredReuse => vec![
             Line::from(Span::styled("Credential reuse", theme::title())),
             Line::from(format!("{} stored creds", app.snap.creds.len())),
@@ -816,55 +1316,12 @@ fn draw_wizards(frame: &mut Frame, app: &App, area: Rect) {
             )));
             v
         }
-        WizardKind::AutoPlan => {
-            let mut v = vec![
-                Line::from(Span::styled(
-                    format!(
-                        "Auto-exploit plan  min={}  space toggle  a rebuild  +/- rank",
-                        app.min_rank.as_str()
-                    ),
-                    theme::title(),
-                )),
-                Line::from(Span::styled(
-                    "Nothing runs until you Ctrl-G. Matches CVE refs, then open ports.",
-                    theme::muted(),
-                )),
-                Line::from(""),
-            ];
-            if app.plan.is_empty() {
-                v.push(Line::from(Span::styled(
-                    "no matches — import hosts or press a to rebuild",
-                    theme::warn(),
-                )));
-            }
-            for (i, p) in app.plan.iter().enumerate() {
-                let sel = i == app.plan_idx;
-                let mark = if p.selected { "[x]" } else { "[ ]" };
-                v.push(Line::from(Span::styled(
-                    format!(
-                        "{} {} {:<16} {:<8} {}  {}",
-                        if sel { "▸" } else { " " },
-                        mark,
-                        p.host,
-                        p.rank,
-                        p.module,
-                        p.reason
-                    ),
-                    if sel {
-                        theme::selected()
-                    } else if p.selected {
-                        theme::ok()
-                    } else {
-                        theme::muted()
-                    },
-                )));
-            }
-            v
-        }
+        WizardKind::AutoPlan => unreachable!("plan rendered separately"),
     };
     frame.render_widget(
         Paragraph::new(right)
-            .block(pane(" wizard ", true))
+            .block(pane(" wizard ", app.focused_pane() == 1))
+            .scroll((app.detail_scroll, 0))
             .wrap(Wrap { trim: true }),
         cols[1],
     );
@@ -899,21 +1356,30 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: u16) {
     );
 }
 
-fn draw_confirm(frame: &mut Frame, area: Rect, title: &str, body: &str) {
+fn draw_confirm(frame: &mut Frame, area: Rect, title: &str, body: &str, scroll: u16) {
     let rect = centered(area, 70, 40);
     frame.render_widget(Clear, rect);
-    let text = format!("{body}\n\nEnter/y confirm   Esc/n cancel");
+    let block = Block::bordered()
+        .border_style(Style::default().fg(theme::orange()))
+        .title(Span::styled(format!(" {title} "), theme::warn()))
+        .style(theme::bg());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let text = format!("{body}\n\n(Enter/y) confirm · (Esc/n) cancel · (PgUp/PgDn) scroll");
+    // Keep text above the confirmation buttons, including on compact terminals.
+    let body_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
     frame.render_widget(
         Paragraph::new(text)
+            .scroll((scroll, 0))
             .style(theme::bg())
             .wrap(Wrap { trim: true })
-            .alignment(Alignment::Left)
-            .block(
-                Block::bordered()
-                    .border_style(Style::default().fg(theme::orange()))
-                    .title(Span::styled(format!(" {title} "), theme::warn())),
-            ),
-        rect,
+            .alignment(Alignment::Left),
+        body_area,
     );
 }
 
@@ -1053,13 +1519,193 @@ mod aurora_audit {
         app.tab = Tab::Hosts;
         app
     }
+
+    #[test]
+    fn compact_wizard_picker_and_plan_show_the_focused_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        app.tab = Tab::Wizards;
+        app.wizard = WizardKind::AutoPlan;
+        app.rebuild_plan_for_test();
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        app.focus_pane(0);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(crate::audit::text(terminal.backend().buffer()).contains("Auto-exploit plan"));
+        app.focus_pane(1);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(crate::audit::text(terminal.backend().buffer()).contains("10.0.0.12"));
+    }
+    #[tokio::test]
+    async fn security_themes_keep_every_screen_and_pane_navigable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        for id in ["crimson", "aurora"] {
+            let action = app
+                .command_actions()
+                .into_iter()
+                .find(|a| {
+                    a.label
+                        == if id == "crimson" {
+                            "Crimson theme"
+                        } else {
+                            "Aurora theme"
+                        }
+                })
+                .expect("theme action");
+            assert_eq!(action.target, crate::navigation::Intent::Theme(id));
+            app.dispatch_intent(action.target);
+            let screens = app
+                .navigation_entries()
+                .iter()
+                .filter(|e| matches!(e.target, crate::navigation::Intent::Screen(_)))
+                .count();
+            for screen in 0..screens {
+                app.select_screen(screen);
+                for pane in 0..app.pane_names().len() {
+                    app.focus_pane(pane);
+                    for &(w, h) in &crate::audit::SIZES[..4] {
+                        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                        terminal.draw(|f| draw(f, &app)).unwrap();
+                        let buffer = terminal.backend().buffer();
+                        assert!(crate::audit::text(buffer).contains("(F2)"));
+                        crate::audit::verify_footer(buffer);
+                        crate::audit::capture(
+                            "breach",
+                            &format!("{id}-screen{screen}-pane{pane}"),
+                            buffer,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn common_navigation_contract_preserves_focus_and_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        app.focus_pane(0);
+        if app.navigation_editing() {
+            let _ = app.handle_key(key(KeyCode::Esc));
+        }
+        let screen = app.navigation_screen();
+        let pane = app.focused_pane();
+        let _ = app.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.navigation_screen(),
+            crate::navigation::step(
+                screen,
+                app.navigation_entries()
+                    .iter()
+                    .filter(|e| matches!(e.target, crate::navigation::Intent::Screen(_)))
+                    .count(),
+                1
+            )
+        );
+        if app.navigation_editing() {
+            let _ = app.handle_key(key(KeyCode::Esc));
+        }
+        let _ = app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.navigation_screen(), screen);
+        let _ = app.handle_key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.focused_pane(),
+            crate::navigation::step(pane, app.pane_names().len(), 1)
+        );
+        let _ = app.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::SHIFT));
+        assert_eq!(app.focused_pane(), pane);
+        let _ = app.handle_key(key(KeyCode::F(2)));
+        assert!(app.navigation.open);
+        let _ = app.handle_key(key(KeyCode::Char('1')));
+        assert!(!app.navigation.open);
+        assert_eq!(app.navigation_screen(), 0);
+        app.select_screen(screen);
+        let _ = app.handle_key(key(KeyCode::F(2)));
+        assert!(app.navigation.open);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(crate::audit::text(terminal.backend().buffer()).contains("Navigate"));
+        let _ = app.handle_key(key(KeyCode::Esc));
+        assert!(!app.navigation.open);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut hit = None;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width.saturating_sub(3) {
+                if buffer[(x, y)].symbol() == "("
+                    && buffer[(x + 1, y)].symbol() == "F"
+                    && buffer[(x + 2, y)].symbol() == "2"
+                {
+                    hit = Some((x, y));
+                    break;
+                }
+            }
+            if hit.is_some() {
+                break;
+            }
+        }
+        let (x, y) = hit.expect("visible clickable navigation");
+        app.navigation_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.navigation.open);
+        let _ = app.handle_key(key(KeyCode::Esc));
+
+        let _ = app.handle_key(commands());
+        assert!(app.commands.open);
+        let _ = app.handle_key(key(KeyCode::Esc));
+    }
+    #[tokio::test]
+    async fn all_screens_and_focus_targets_fit_the_navigation_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        let screens = app
+            .navigation_entries()
+            .iter()
+            .filter(|e| matches!(e.target, crate::navigation::Intent::Screen(_)))
+            .count();
+        for screen in 0..screens {
+            app.select_screen(screen);
+            for pane in 0..app.pane_names().len() {
+                app.focus_pane(pane);
+                for &(w, h) in &crate::audit::SIZES[..4] {
+                    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                    terminal.draw(|f| draw(f, &app)).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert!(
+                        crate::audit::text(buffer).contains("(F2)"),
+                        "screen {screen} pane {pane} must expose navigation at {w}x{h}"
+                    );
+                    crate::audit::verify_footer(buffer);
+                    crate::audit::capture(
+                        "breach",
+                        &format!("navigation-screen{screen}-pane{pane}"),
+                        buffer,
+                    );
+                    let before = app.navigation_screen();
+                    app.navigation_mouse(crossterm::event::MouseEvent {
+                        kind: crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        ),
+                        column: w + 1,
+                        row: h + 1,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    assert_eq!(app.navigation_screen(), before);
+                }
+            }
+        }
+    }
     #[test]
     fn hosts_cycle_both_ways_and_inputs_own_commands() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = fixture(dir.path());
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::F(6)));
         assert!(app.host_pane == HostPane::Detail);
-        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::F(6)));
         assert!(app.host_pane == HostPane::List);
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(commands());
@@ -1068,6 +1714,127 @@ mod aurora_audit {
         app.handle_key(commands());
         assert!(app.commands.open);
         assert!(app.demo);
+    }
+    #[test]
+    #[ignore = "interactive mock fixture for visual QA"]
+    fn live_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        if let Ok(id) = std::env::var("TUI_PREVIEW_THEME") {
+            crate::theme::set(&id);
+        }
+        match std::env::var("AURORA_PREVIEW_SCREEN").as_deref() {
+            Ok("plan") => {
+                app.tab = Tab::Wizards;
+                app.wizard = WizardKind::AutoPlan;
+                app.rebuild_plan_for_test();
+            }
+            Ok("validation") => {
+                app.tab = Tab::Wizards;
+                app.wizard = WizardKind::Validate;
+                app.validations = vec![crate::model::ValidationResult {
+                    workspace: app.snap.workspace.clone(),
+                    host: "192.0.2.10".into(),
+                    module: "windows/smb/ms17_010_eternalblue".into(),
+                    code: "vulnerable".into(),
+                    message: "Mock: target is vulnerable".into(),
+                    ..Default::default()
+                }];
+            }
+            Ok("tasks") => {
+                app.tab = Tab::Tasks;
+                let mut task = crate::model::TaskLog::new("chain", "fixture validation workflow");
+                task.status = "complete".into();
+                task.detail="Step 1/3: import scan.xml\nStep complete\nStep 2/3: validate vulnerabilities\nUUID=mock-job job=7\nValidation: vulnerable — mock finding\nStep complete\nStep 3/3: report json,html\nStep complete".into();
+                app.tasks = vec![task];
+            }
+            _ => {}
+        }
+        if std::env::var("AURORA_PREVIEW_SCREEN").is_ok() {
+            app.focus_pane(1);
+        }
+        match std::env::var("AURORA_NAV_PREVIEW").as_deref() {
+            Ok("confirm") => {
+                app.modal=Modal::Confirm{title:"Run reviewed plan?".into(),body:"Mock review: selected modules and targets. No backend operations run in this preview.".into(),action:crate::app::Action::RunPlan};
+            }
+            Ok("menu") => app.navigation.toggle(),
+            Ok("actions") => app.commands.open = true,
+            Ok("focused") => app.focus_pane(1),
+            _ => {}
+        }
+        crate::audit::live_preview(
+            &mut app,
+            |f, a| draw(f, a),
+            |a, k| {
+                if matches!(
+                    k.code,
+                    KeyCode::F(2)
+                        | KeyCode::F(6)
+                        | KeyCode::Tab
+                        | KeyCode::BackTab
+                        | KeyCode::Down
+                        | KeyCode::Up
+                        | KeyCode::Esc
+                        | KeyCode::Char('0'..='9')
+                ) {
+                    a.handle_key(k);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn pro_workflow_views_fit_and_large_plan_selection_stays_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        app.tab = Tab::Wizards;
+        app.wizard = WizardKind::AutoPlan;
+        app.plan = (0..200)
+            .map(|i| crate::model::PlanItem {
+                host: format!("192.0.2.{i}"),
+                module: format!("linux/http/fixture_{i}"),
+                kind: "exploit".into(),
+                rank: "great".into(),
+                reason: "CVE-2026-1234 match".into(),
+                rport: Some(80),
+                selected: true,
+            })
+            .collect();
+        app.plan_idx = 199;
+        app.focus_pane(1);
+        for &(w, h) in &crate::audit::SIZES[..4] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app)).unwrap();
+            let text = crate::audit::text(term.backend().buffer());
+            assert!(
+                text.contains("192.0.2.199"),
+                "selected plan must remain visible at {w}x{h}: {text}"
+            );
+            crate::audit::verify_footer(term.backend().buffer());
+        }
+        app.wizard = WizardKind::Validate;
+        app.validations = vec![crate::model::ValidationResult {
+            workspace: app.snap.workspace.clone(),
+            host: "192.0.2.4".into(),
+            code: "vulnerable".into(),
+            message: "Mock finding".into(),
+            ..Default::default()
+        }];
+        for wizard in WizardKind::all() {
+            app.wizard = wizard;
+            for &(w, h) in &crate::audit::SIZES[..4] {
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| draw(f, &app)).unwrap();
+                crate::audit::verify_footer(term.backend().buffer());
+            }
+        }
+        app.tab = Tab::Tasks;
+        app.active_workflow = Some("fixture".into());
+        for &(w, h) in &crate::audit::SIZES[..4] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app)).unwrap();
+            crate::audit::verify_footer(term.backend().buffer());
+        }
     }
     #[test]
     fn responsive_render_matrix() {
@@ -1091,8 +1858,32 @@ mod aurora_audit {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
             term.draw(|f| draw(f, &app)).unwrap();
             let buffer = term.backend().buffer();
-            if w >= 30 && h >= 10 {
-                assert!(crate::audit::text(buffer).contains("breach"));
+            if w >= 30 && h >= 14 {
+                assert!(
+                    buffer
+                        .content
+                        .iter()
+                        .any(|cell| matches!(cell.symbol(), "█" | "▀" | "▄")
+                            && cell.fg == crate::theme::pink())
+                );
+            }
+            if w >= 60 && h >= 20 {
+                assert!(
+                    crate::audit::text(buffer).contains("10.0.0.5"),
+                    "selected host must remain visible below the larger title"
+                );
+            }
+            crate::audit::verify_footer(buffer);
+            if w >= 80 && h >= 30 {
+                for y in 12..h - 6 {
+                    for x in w / 2..w - 8 {
+                        assert_eq!(
+                            buffer[(x, y)].bg,
+                            theme::bg_color(),
+                            "host inspector background at {x},{y}"
+                        );
+                    }
+                }
             }
             crate::audit::capture("breach", "main", buffer);
         }
@@ -1119,6 +1910,7 @@ mod aurora_audit {
             for &(w, h) in &crate::audit::SIZES[..4] {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
                 term.draw(|f| draw(f, &app)).unwrap();
+                crate::audit::verify_footer(term.backend().buffer());
                 crate::audit::capture("breach", "offline", term.backend().buffer());
             }
         }

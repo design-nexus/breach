@@ -67,6 +67,11 @@ pub struct Choice {
 /// Built-in catalog. Omarchy is resolved from disk, not from this list's colors.
 pub static CHOICES: &[Choice] = &[
     Choice {
+        id: "crimson",
+        label: "Crimson",
+        group: "Built-in",
+    },
+    Choice {
         id: "aurora",
         label: "Aurora",
         group: "Built-in",
@@ -194,6 +199,7 @@ pub fn known(id: &str) -> bool {
 
 pub fn by_id(id: &str) -> Option<Theme> {
     Some(match id {
+        "crimson" => crimson(),
         "aurora" => aurora(),
         "terminal" => terminal(),
         "catppuccin-mocha" => mocha(),
@@ -227,11 +233,11 @@ pub fn resolve(id: &str, omarchy: Option<&Theme>) -> Theme {
             return theme.clone();
         }
     }
-    by_id(id).unwrap_or_else(mocha)
+    by_id(id).unwrap_or_else(crimson)
 }
 
 pub fn fallback_id(_omarchy_installed: bool) -> &'static str {
-    "aurora"
+    "crimson"
 }
 
 fn terminal() -> Theme {
@@ -607,9 +613,9 @@ mod tests {
         let theme = resolve("omarchy", Some(&custom));
         assert_eq!(theme.name, "Omarchy · catppuccin");
         let fallback = resolve("omarchy", None);
-        assert_eq!(fallback.id, "catppuccin-mocha");
-        assert_eq!(fallback_id(false), "aurora");
-        assert_eq!(fallback_id(true), "aurora");
+        assert_eq!(fallback.id, "crimson");
+        assert_eq!(fallback_id(false), "crimson");
+        assert_eq!(fallback_id(true), "crimson");
     }
 }
 
@@ -625,4 +631,39 @@ pub fn aurora() -> Theme {
     );
     theme.selection_fg = theme.accent;
     theme
+}
+
+/// Security console palette. Data and status retain distinct semantic colors.
+pub fn crimson() -> Theme {
+    let mut theme = pal(
+        "crimson",
+        "Crimson",
+        Kind::Dark,
+        [
+            "0b0d10", "07090c", "181c23", "343b47", "28151e", "d6dbe4", "8793a5", "8793a5",
+            "ff4d6d", "ff6b6b", "e5b56d", "7ac7a0", "64d8e8", "64d8e8", "ff4d6d",
+        ],
+    );
+    theme.selection_fg = hex("ff8298");
+    theme
+}
+#[cfg(test)]
+mod crimson_tests {
+    use super::*;
+    #[test]
+    fn crimson_roles_and_fallback_keep_aurora_available() {
+        let theme = resolve("crimson", None);
+        assert_eq!(theme.id, "crimson");
+        assert!(CHOICES.iter().any(|c| c.id == "crimson"));
+        assert_eq!(theme.bg, hex("0b0d10"));
+        assert_eq!(theme.accent, hex("ff4d6d"));
+        assert_eq!(theme.cyan, hex("64d8e8"));
+        assert_eq!(theme.selection, hex("28151e"));
+        assert_eq!(theme.selection_fg, hex("ff8298"));
+        assert_ne!(theme.green, theme.accent);
+        assert_ne!(theme.yellow, theme.red);
+        assert_eq!(resolve("unknown", None).id, "crimson");
+        assert_eq!(resolve("aurora", None).id, "aurora");
+        assert_eq!(resolve("terminal", None).id, "terminal");
+    }
 }

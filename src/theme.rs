@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 #[allow(dead_code, unused_imports)]
 mod palette;
 use std::cell::RefCell;
-thread_local! { static ACTIVE: RefCell<(String, palette::Theme)> = RefCell::new(("aurora".into(), palette::aurora())); }
+thread_local! { static ACTIVE: RefCell<(String, palette::Theme)> = RefCell::new(("crimson".into(), palette::crimson())); }
 pub fn set(id: &str) {
     let om = if id == "omarchy" {
         palette::find_omarchy().map(|(_, t, _)| t)
@@ -36,10 +36,7 @@ pub fn muted() -> Style {
 }
 
 pub fn selected() -> Style {
-    Style::default()
-        .bg(current())
-        .fg(purple())
-        .add_modifier(Modifier::BOLD)
+    ACTIVE.with(|a| a.borrow().1.selected().add_modifier(Modifier::BOLD))
 }
 
 pub fn ok() -> Style {
@@ -96,6 +93,10 @@ pub fn bg_color() -> Color {
 
 pub fn current() -> Color {
     ACTIVE.with(|a| a.borrow().1.bg_raised)
+}
+
+pub fn deep() -> Color {
+    ACTIVE.with(|a| a.borrow().1.bg_deep)
 }
 
 pub fn fg() -> Color {
@@ -157,5 +158,36 @@ mod persistence_tests {
         assert!(text.contains("localhost"));
         set("aurora");
         assert_eq!(bg_color(), Color::Rgb(0x17, 0x18, 0x20));
+    }
+}
+
+#[cfg(test)]
+mod security_theme_persistence {
+    use super::*;
+    #[test]
+    fn default_and_explicit_theme_choices_survive_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        set(&crate::persist::load_config(&path).theme);
+        assert_eq!(bg_color(), palette::hex("0b0d10"));
+        for id in ["aurora", "crimson", "terminal", "omarchy"] {
+            let mut config = crate::persist::load_config(&path);
+            config.theme = id.into();
+            crate::persist::save_config(&path, &config).unwrap();
+            set(&crate::persist::load_config(&path).theme);
+            let saved: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved.get("theme").unwrap().as_str(), Some(id));
+            if id == "aurora" {
+                assert_eq!(bg_color(), palette::hex("171820"));
+            }
+            if id == "crimson" {
+                assert_eq!(selected().bg, Some(palette::hex("28151e")));
+                assert_eq!(selected().fg, Some(palette::hex("ff8298")));
+            }
+        }
+        std::fs::write(&path, "host = \"localhost\"\n").unwrap();
+        set(&crate::persist::load_config(&path).theme);
+        assert_eq!(bg_color(), palette::hex("0b0d10"));
     }
 }
