@@ -1,13 +1,13 @@
 #!/bin/sh
-# Nexus-MSF installer.
+# breach installer.
 # One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/kensmith77/Nexus-MSF/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/design-nexus/breach/main/install.sh | sh
 set -eu
 
-REPO="${NEXUS_MSF_REPO:-https://github.com/kensmith77/Nexus-MSF}"
-BIN_NAME="nexus-msf"
+REPO="${NEXUS_MSF_REPO:-https://github.com/design-nexus/breach}"
+BIN_NAME="breach"
 NEED_RUST_MAJOR=1
-NEED_RUST_MINOR=85
+NEED_RUST_MINOR=88
 
 say() { printf '%s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -122,12 +122,12 @@ ensure_build_deps() {
   fi
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
   ensure_path_cargo
-  rustc_ok || err "rustc $NEED_RUST_MAJOR.$NEED_RUST_MINOR+ is required (edition 2024)"
+  rustc_ok || err "rustc $NEED_RUST_MAJOR.$NEED_RUST_MINOR+ is required (Ratatui 0.30.2)"
   have cargo || err "cargo not found after rustup install"
 }
 
 install_from_git() {
-  say "Building Nexus-MSF from $REPO…"
+  say "Building breach from $REPO…"
   cargo install --git "$REPO" --locked --force "$BIN_NAME"
 }
 
@@ -137,7 +137,7 @@ warn_msf() {
   else
     say ""
     say "note: Metasploit Framework is not on PATH."
-    say "      nexus-msf --demo works without it; live RPC needs msfrpcd."
+    say "      breach --demo works without it; live RPC needs msfrpcd."
   fi
 }
 

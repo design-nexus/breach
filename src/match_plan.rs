@@ -51,7 +51,10 @@ fn refs_overlap(module: &ModuleMeta, vuln_refs: &[String], vuln_name: &str) -> O
         if r.is_empty() {
             continue;
         }
-        if mrefs.iter().any(|m| m == r || m.contains(r) || r.contains(m.as_str())) {
+        if mrefs
+            .iter()
+            .any(|m| m == r || m.contains(r) || r.contains(m.as_str()))
+        {
             return Some(r.clone());
         }
     }

@@ -84,10 +84,7 @@ impl Client {
 
     pub async fn login(&mut self, user: &str, pass: &str) -> Result<()> {
         let v = self
-            .call(
-                "auth.login",
-                &[Value::from(user), Value::from(pass)],
-            )
+            .call("auth.login", &[Value::from(user), Value::from(pass)])
             .await?;
         let map = as_map(&v).context("login response")?;
         let token = map_str(&map, "token").context("no token")?;
@@ -231,9 +228,7 @@ impl Worker {
             Cmd::SetWorkspace(name) => self.set_workspace(&name).await,
             Cmd::JobStop(id) => {
                 let c = self.cli()?;
-                let _ = c
-                    .call("job.stop", &[Value::from(id.clone())])
-                    .await?;
+                let _ = c.call("job.stop", &[Value::from(id.clone())]).await?;
                 self.emit(Event::Status(format!("stopped job {id}")));
                 self.refresh().await
             }
@@ -265,7 +260,10 @@ impl Worker {
 
     async fn connect(&mut self) -> Result<()> {
         if !self.cfg.is_loopback() && self.cfg.spawn {
-            bail!("refusing to spawn msfrpcd on non-loopback host {}", self.cfg.host);
+            bail!(
+                "refusing to spawn msfrpcd on non-loopback host {}",
+                self.cfg.host
+            );
         }
         self.emit(Event::Status("connecting…".into()));
         if let Err(e) = self.try_login().await {
@@ -421,9 +419,7 @@ impl Worker {
         let Some(c) = self.client.as_ref() else {
             return Ok(());
         };
-        let v = c
-            .call("console.read", &[Value::from(id.as_str())])
-            .await?;
+        let v = c.call("console.read", &[Value::from(id.as_str())]).await?;
         let map = as_map(&v).unwrap_or_default();
         let data = map_str(&map, "data").unwrap_or_default();
         let busy = map_bool(&map, "busy");
@@ -479,18 +475,12 @@ impl Worker {
             .cli()?
             .call(
                 "module.execute",
-                &[
-                    Value::from(kind),
-                    Value::from(name),
-                    Value::Map(map),
-                ],
+                &[Value::from(kind), Value::from(name), Value::Map(map)],
             )
             .await?;
         let parsed = as_map(&v).unwrap_or_default();
         let job = map_str(&parsed, "job_id").unwrap_or_else(|| "?".into());
-        self.emit(Event::Status(format!(
-            "executed {kind}/{name} job={job}"
-        )));
+        self.emit(Event::Status(format!("executed {kind}/{name} job={job}")));
         self.refresh().await
     }
 
@@ -502,10 +492,7 @@ impl Worker {
         self.cli()?
             .call(
                 "db.import_data",
-                &[Value::Map(vec![(
-                    Value::from("data"),
-                    Value::from(data),
-                )])],
+                &[Value::Map(vec![(Value::from("data"), Value::from(data))])],
             )
             .await?;
         self.emit(Event::Status(format!("imported {path}")));
@@ -611,17 +598,36 @@ impl Worker {
             .unwrap_or_else(|| "default".into());
         let wslist = c.call("db.workspaces", &[]).await.unwrap_or(Value::Nil);
         let workspaces = parse_workspaces(&wslist);
-        let hosts = parse_hosts(&c.call("db.hosts", &[empty_ws(&workspace)]).await.unwrap_or(Value::Nil));
-        let services =
-            parse_services(&c.call("db.services", &[empty_ws(&workspace)]).await.unwrap_or(Value::Nil));
-        let vulns =
-            parse_vulns(&c.call("db.vulns", &[empty_ws(&workspace)]).await.unwrap_or(Value::Nil));
-        let notes =
-            parse_notes(&c.call("db.notes", &[empty_ws(&workspace)]).await.unwrap_or(Value::Nil));
-        let creds =
-            parse_creds(&c.call("db.creds", &[empty_ws(&workspace)]).await.unwrap_or(Value::Nil));
-        let loot =
-            parse_loot(&c.call("db.loots", &[empty_ws(&workspace)]).await.unwrap_or(Value::Nil));
+        let hosts = parse_hosts(
+            &c.call("db.hosts", &[empty_ws(&workspace)])
+                .await
+                .unwrap_or(Value::Nil),
+        );
+        let services = parse_services(
+            &c.call("db.services", &[empty_ws(&workspace)])
+                .await
+                .unwrap_or(Value::Nil),
+        );
+        let vulns = parse_vulns(
+            &c.call("db.vulns", &[empty_ws(&workspace)])
+                .await
+                .unwrap_or(Value::Nil),
+        );
+        let notes = parse_notes(
+            &c.call("db.notes", &[empty_ws(&workspace)])
+                .await
+                .unwrap_or(Value::Nil),
+        );
+        let creds = parse_creds(
+            &c.call("db.creds", &[empty_ws(&workspace)])
+                .await
+                .unwrap_or(Value::Nil),
+        );
+        let loot = parse_loot(
+            &c.call("db.loots", &[empty_ws(&workspace)])
+                .await
+                .unwrap_or(Value::Nil),
+        );
         let sessions = parse_sessions(&c.call("session.list", &[]).await.unwrap_or(Value::Nil));
         let jobs = parse_jobs(&c.call("job.list", &[]).await.unwrap_or(Value::Nil));
 
@@ -649,8 +655,7 @@ impl Worker {
         Ok(Snapshot {
             version: map_str(&ver_map, "version").unwrap_or_else(|| "unknown".into()),
             ruby: map_str(&ver_map, "ruby").unwrap_or_default(),
-            db_ok: map_str(&db_map, "driver")
-                .is_some_and(|d| d != "unknown")
+            db_ok: map_str(&db_map, "driver").is_some_and(|d| d != "unknown")
                 || map_bool(&db_map, "ok"),
             workspace,
             workspaces,
@@ -709,7 +714,11 @@ fn find_msfrpcd() -> Option<PathBuf> {
         "/opt/metasploit-framework/msfrpcd",
         "/snap/bin/msfrpcd",
     ];
-    CANDIDATES.iter().map(Path::new).find(|p| p.is_file()).map(Path::to_path_buf)
+    CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .map(Path::to_path_buf)
 }
 
 fn empty_ws(ws: &str) -> Value {
@@ -786,7 +795,11 @@ fn parse_workspaces(v: &Value) -> Vec<String> {
             }
         }
     } else if let Some(m) = as_map(v) {
-        if let Some(arr) = m.iter().find(|(k, _)| k == "workspaces").and_then(|(_, v)| v.as_array()) {
+        if let Some(arr) = m
+            .iter()
+            .find(|(k, _)| k == "workspaces")
+            .and_then(|(_, v)| v.as_array())
+        {
             for x in arr {
                 if let Some(s) = x.as_str() {
                     out.push(s.into());
@@ -959,7 +972,11 @@ fn rows(v: &Value, key: &str) -> Vec<Map> {
         return arr.iter().filter_map(as_map).collect();
     }
     if let Some(m) = as_map(v) {
-        if let Some(arr) = m.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_array()) {
+        if let Some(arr) = m
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.as_array())
+        {
             return arr.iter().filter_map(as_map).collect();
         }
         // single row
@@ -1049,14 +1066,12 @@ mod tests {
 
     #[test]
     fn login_response_from_wire() {
-        let bytes: &[u8] = b"\x82\xc4\x06result\xc4\x07success\xc4\x05token\xc4 TEMPUl2yTx1AMmX43T9WLeN8thjG1dul";
+        let bytes: &[u8] =
+            b"\x82\xc4\x06result\xc4\x07success\xc4\x05token\xc4 TEMPUl2yTx1AMmX43T9WLeN8thjG1dul";
         // 0x20 after last c4 is length 32; the space in the rust string is that byte.
         let v = decode_value(bytes).expect("decode");
         let map = as_map(&v).expect("map");
         assert_eq!(map_str(&map, "result").as_deref(), Some("success"));
-        assert_eq!(
-            map_str(&map, "token").unwrap().len(),
-            32
-        );
+        assert_eq!(map_str(&map, "token").unwrap().len(), 32);
     }
 }

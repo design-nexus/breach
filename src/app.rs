@@ -155,6 +155,8 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub detail_scroll: u16,
+    pub commands: crate::commands::Palette,
     pub tab: Tab,
     pub should_quit: bool,
     pub status: String,
@@ -210,8 +212,19 @@ pub struct App {
 }
 
 impl App {
+    fn apply_aurora_theme(&mut self, id: &str) {
+        self.config.theme = id.into();
+        if let Err(err) = persist::save_config(&self.paths.config, &self.config) {
+            self.status = format!("Saving theme: {err}");
+        }
+        crate::theme::set(id);
+    }
+
     pub fn new(demo: bool) -> anyhow::Result<Self> {
-        let paths = Paths::resolve()?;
+        Self::with_paths(demo, Paths::resolve()?)
+    }
+
+    pub fn with_paths(demo: bool, paths: Paths) -> anyhow::Result<Self> {
         persist::seed_defaults(&paths)?;
         let mut config = persist::load_config(&paths.config);
         if config.password.is_empty() {
@@ -224,6 +237,7 @@ impl App {
                 persist::save_config(&paths.config, &config)?;
             }
         }
+        crate::theme::set(&config.theme);
         let favorites = persist::load_favorites(&paths.favorites);
         let audit = persist::load_audit(&paths.audit, 80);
         let chains = chains::load_dir(&paths.chains);
@@ -253,6 +267,8 @@ impl App {
             )
         };
         Ok(Self {
+            commands: crate::commands::Palette::default(),
+            detail_scroll: 0,
             tab: Tab::Dash,
             should_quit: false,
             status,
@@ -340,6 +356,7 @@ impl App {
     }
 
     pub async fn on_tick(&mut self) {
+        crate::theme::refresh();
         let mut events = Vec::new();
         if let Some(rx) = self.ev_rx.as_mut() {
             while let Ok(e) = rx.try_recv() {
@@ -517,6 +534,44 @@ impl App {
             self.handle_modal_key(key);
             return;
         }
+        if self.commands.open
+            || (key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            if let Some(action) = self.commands.handle(key, ACTIONS) {
+                if action.modifiers == KeyModifiers::ALT {
+                    let id = match action.key {
+                        KeyCode::Char('o') => "omarchy",
+                        KeyCode::Char('t') => "terminal",
+                        _ => "aurora",
+                    };
+                    self.apply_aurora_theme(id);
+                } else {
+                    self.handle_key(action.event());
+                }
+            }
+            return;
+        }
+        if self.tab == Tab::Hosts && self.host_pane == HostPane::Detail {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    return;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(8);
+                    return;
+                }
+                KeyCode::PageUp => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(8);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.tab == Tab::Console && !key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char(c @ '0'..='9') if self.console_in.value.is_empty() => {
@@ -642,7 +697,7 @@ impl App {
     fn cycle_pane(&mut self, dir: i32) {
         match self.tab {
             Tab::Hosts => {
-                self.host_pane = if dir > 0 {
+                self.host_pane = if self.host_pane == HostPane::List {
                     HostPane::Detail
                 } else {
                     HostPane::List
@@ -850,11 +905,9 @@ impl App {
                     .unwrap_or_default(),
             ),
             Tab::Wizards => match self.wizard {
-                WizardKind::Payload => self.confirm(
-                    Action::Venom,
-                    "Run msfvenom?",
-                    &self.venom.preview(),
-                ),
+                WizardKind::Payload => {
+                    self.confirm(Action::Venom, "Run msfvenom?", &self.venom.preview())
+                }
                 WizardKind::AutoPlan => self.confirm(
                     Action::RunPlan,
                     "Run selected plan items?",
@@ -1069,7 +1122,9 @@ impl App {
                     self.rebuild_plan();
                     self.run_plan();
                 }
-                Step::CollectEvidence { r#macro: macro_name } => {
+                Step::CollectEvidence {
+                    r#macro: macro_name,
+                } => {
                     self.run_macro_named(&macro_name);
                 }
                 Step::Report { .. } => {
@@ -1097,7 +1152,8 @@ impl App {
                 self.rebuild_plan();
                 self.tab = Tab::Wizards;
                 self.wizard = WizardKind::AutoPlan;
-                self.status = "discovered (or queued). review auto-exploit plan, then Ctrl-G".into();
+                self.status =
+                    "discovered (or queued). review auto-exploit plan, then Ctrl-G".into();
             }
             WizardKind::Validate => {
                 self.import_scan();
@@ -1271,10 +1327,7 @@ impl App {
         for step in &m.steps {
             let mut opts = step.options.clone();
             opts.insert("SESSION".into(), sess.id.clone());
-            let name = step
-                .module
-                .trim_start_matches("post/")
-                .to_string();
+            let name = step.module.trim_start_matches("post/").to_string();
             self.send(Cmd::ExecuteModule {
                 kind: "post".into(),
                 name,
@@ -1562,6 +1615,7 @@ impl App {
         let n = ids.len() as i32;
         let np = (pos + d).rem_euclid(n) as usize;
         self.host_idx = ids[np];
+        self.detail_scroll = 0;
     }
 
     fn cycle_workspace(&mut self, d: i32) {
@@ -1620,7 +1674,7 @@ mod tests {
 
 impl App {
     pub fn help_text() -> &'static str {
-        "Nexus-MSF — Dracula TUI for Metasploit Framework\n\
+        "Breach — Aurora TUI for Metasploit Framework\n\
          Authorized testing only. Wraps msfrpcd / msfvenom; no exploit payloads shipped.\n\n\
          1 Dash   2 Hosts   3 Modules   4 Sessions   5 Creds\n\
          6 Tasks  7 Chains  8 Reports   9 Console    0 Wizards\n\n\
@@ -1637,3 +1691,16 @@ impl App {
          --demo walks the UI with sample data and never talks to Framework."
     }
 }
+
+pub const ACTIONS: &[crate::commands::Action] = &[
+    crate::commands::Action::key("Dashboard", '1'),
+    crate::commands::Action::key("Hosts", '2'),
+    crate::commands::Action::key("Modules", '3'),
+    crate::commands::Action::key("Sessions", '4'),
+    crate::commands::Action::ctrl("Review and run", 'g'),
+    crate::commands::Action::key("Filter", '/'),
+    crate::commands::Action::key("Help", '?'),
+    crate::commands::Action::theme("Aurora theme", 'a'),
+    crate::commands::Action::theme("Follow Omarchy theme", 'o'),
+    crate::commands::Action::theme("Terminal theme", 't'),
+];

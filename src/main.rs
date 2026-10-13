@@ -1,6 +1,9 @@
 mod app;
+#[cfg(test)]
+mod audit;
 mod catalog;
 mod chains;
+mod commands;
 mod demo;
 mod input;
 mod macros;
@@ -23,8 +26,9 @@ use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "nexus-msf",
-    about = "Nexus-MSF — Dracula-themed TUI frontend for Metasploit Framework",
+    name = "breach",
+    version,
+    about = "breach — Aurora TUI frontend for Metasploit Framework",
     after_help = "Only use against systems you own or have permission to test.\n\
                   Set NEXUS_MSF_RPC_PASS or config.toml password before connecting."
 )]
@@ -125,7 +129,27 @@ fn write_screenshot(app: &App, path: &std::path::Path) -> anyhow::Result<()> {
                 ));
             }
             let sym = cell.symbol();
-            if sym.trim().is_empty() && sym != "█" && !matches!(sym, "▸" | "▌" | "—" | "│" | "─" | "┌" | "┐" | "└" | "┘" | "├" | "┤" | "┬" | "┴" | "┼" | "║" | "═") {
+            if sym.trim().is_empty()
+                && sym != "█"
+                && !matches!(
+                    sym,
+                    "▸" | "▌"
+                        | "—"
+                        | "│"
+                        | "─"
+                        | "┌"
+                        | "┐"
+                        | "└"
+                        | "┘"
+                        | "├"
+                        | "┤"
+                        | "┬"
+                        | "┴"
+                        | "┼"
+                        | "║"
+                        | "═"
+                )
+            {
                 if sym.chars().all(|c| c == ' ' || c == '\0') {
                     continue;
                 }

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_theme")]
+    pub theme: String,
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
@@ -21,6 +23,9 @@ pub struct Config {
     pub uri: String,
 }
 
+fn default_theme() -> String {
+    "aurora".into()
+}
 fn default_host() -> String {
     "127.0.0.1".into()
 }
@@ -40,6 +45,7 @@ fn default_uri() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            theme: default_theme(),
             host: default_host(),
             port: default_port(),
             username: default_user(),

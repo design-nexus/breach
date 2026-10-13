@@ -10,7 +10,12 @@ pub struct ReportFiles {
     pub json: PathBuf,
 }
 
-pub fn render(dir: &Path, snap: &Snapshot, audit: &[AuditEntry], redact: bool) -> anyhow::Result<ReportFiles> {
+pub fn render(
+    dir: &Path,
+    snap: &Snapshot,
+    audit: &[AuditEntry],
+    redact: bool,
+) -> anyhow::Result<ReportFiles> {
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
     let out = dir.join(format!("{stamp}-{}", snap.workspace));
     std::fs::create_dir_all(&out)?;
@@ -38,7 +43,7 @@ pub fn render(dir: &Path, snap: &Snapshot, audit: &[AuditEntry], redact: bool) -
 
 pub fn markdown(snap: &Snapshot, audit: &[AuditEntry], redact: bool) -> String {
     let mut s = String::new();
-    s.push_str("# Nexus-MSF workspace report\n\n");
+    s.push_str("# breach workspace report\n\n");
     s.push_str(&format!(
         "Workspace **{}** · Framework **{}** · generated {}\n\n",
         snap.workspace,
@@ -145,18 +150,18 @@ fn html_page(md: &str, workspace: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
-<title>Nexus-MSF · {workspace}</title>
+<title>breach · {workspace}</title>
 <style>
-  body {{ background:#282a36; color:#f8f8f2; font-family: ui-monospace, monospace; margin: 2rem; }}
-  h1,h2,h3 {{ color:#bd93f9; }}
-  a {{ color:#8be9fd; }}
-  code {{ color:#50fa7b; }}
+  body {{ background:#171820; color:#ececf4; font-family: ui-monospace, monospace; margin: 2rem; }}
+  h1,h2,h3 {{ color:#b5a0ff; }}
+  a {{ color:#83d9dc; }}
+  code {{ color:#a3d6b0; }}
   table {{ border-collapse: collapse; }}
-  td, th {{ border: 1px solid #44475a; padding: .3rem .6rem; }}
-  pre {{ white-space: pre-wrap; background:#21222c; padding: 1rem; border: 1px solid #44475a; }}
+  td, th {{ border: 1px solid #3d4054; padding: .3rem .6rem; }}
+  pre {{ white-space: pre-wrap; background:#222432; padding: 1rem; border: 1px solid #3d4054; }}
 </style></head>
 <body>
-<p style="color:#ff79c6">Nexus-MSF · Dracula · authorized testing only</p>
+<p style="color:#b5a0ff">Breach · Aurora · authorized testing only</p>
 <pre>{escaped}</pre>
 </body></html>
 "#

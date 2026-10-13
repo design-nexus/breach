@@ -11,10 +11,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(theme::bg()), area);
 
+    if area.width < 30 || area.height < 10 {
+        frame.render_widget(
+            Paragraph::new("breach · needs 30×10\nResize terminal; q quits"),
+            area,
+        );
+        return;
+    }
     let chunks = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(8),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .split(area);
 
@@ -45,42 +52,92 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_prompt(frame, area, title, &app.edit.value, app.edit.cursor);
         }
     }
+    app.commands.draw(
+        frame,
+        crate::app::ACTIONS,
+        theme::bg_color(),
+        theme::fg(),
+        theme::purple(),
+        theme::current(),
+    );
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let titles: Vec<Line> = Tab::all()
-        .into_iter()
-        .map(|t| Line::from(Span::styled(format!(" {} ", t.title()), theme::muted())))
-        .collect();
-    let selected = Tab::all().iter().position(|t| *t == app.tab).unwrap_or(0);
-    let mode = if app.demo { "DEMO" } else { "RPC" };
-    let ver = if app.snap.version.is_empty() {
-        "offline"
+    let [identity, tabs, context] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+    ])
+    .areas(area);
+    let state = if app.demo {
+        "○ demo"
+    } else if app.connected {
+        "● RPC connected"
     } else {
-        app.snap.version.as_str()
+        "○ RPC offline"
     };
-    let tabs = Tabs::new(titles)
-        .select(selected)
-        .highlight_style(theme::accent())
-        .block(
-            Block::bordered()
-                .border_style(Style::default().fg(theme::COMMENT))
-                .title(Span::styled(
-                    format!(
-                        " Nexus-MSF  {ver}  {mode}  ws:{}  Dracula ",
-                        if app.snap.workspace.is_empty() {
-                            "-"
-                        } else {
-                            app.snap.workspace.as_str()
-                        }
-                    ),
-                    theme::title(),
-                )),
-        );
-    frame.render_widget(tabs, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" breach", theme::title()),
+            Span::styled("  Metasploit / workspace lab  ", theme::muted()),
+            Span::styled(state, theme::ok()),
+        ])),
+        identity,
+    );
+    let all = Tab::all();
+    let selected = all.iter().position(|t| *t == app.tab).unwrap_or(0);
+    let start = if area.width < 100 {
+        selected.saturating_sub(2)
+    } else {
+        0
+    };
+    let count = if area.width < 100 { 5 } else { 10 };
+    let titles: Vec<Line> = all
+        .iter()
+        .skip(start)
+        .take(count)
+        .map(|t| Line::from(t.title()))
+        .collect();
+    frame.render_widget(
+        Tabs::new(titles)
+            .select(selected - start)
+            .highlight_style(theme::accent())
+            .divider("  "),
+        tabs,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Workspace ", theme::muted()),
+            Span::styled(
+                if app.snap.workspace.is_empty() {
+                    "—"
+                } else {
+                    &app.snap.workspace
+                },
+                theme::ip(),
+            ),
+            Span::styled(
+                format!(
+                    "   Hosts {}  Sessions {}  Jobs {}",
+                    app.snap.hosts.len(),
+                    app.snap.sessions.len(),
+                    app.snap.jobs.len()
+                ),
+                theme::muted(),
+            ),
+        ])),
+        context,
+    );
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let [keys, status] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(" Tab pane  / filter  ^K actions  q quit").style(theme::muted()),
+        keys,
+    );
+    let area = status;
     let state = if app.busy {
         Span::styled(" BUSY ", theme::warn().add_modifier(Modifier::BOLD))
     } else if app.connected {
@@ -101,10 +158,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             theme::ip(),
         ),
         Span::styled(format!(" {} ", app.status), theme::muted()),
-        Span::styled(
-            "  ? help  ^G run  / filter  y yank  q quit",
-            theme::muted(),
-        ),
+        Span::styled("  Tab pane  / filter  ^K actions  q quit", theme::muted()),
     ]);
     frame.render_widget(Paragraph::new(line).style(theme::bg()), area);
 }
@@ -112,11 +166,19 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 fn pane(title: &str, focused: bool) -> Block<'_> {
     Block::bordered()
         .border_style(theme::pane_border(focused))
-        .title(Span::styled(title, if focused { theme::accent() } else { theme::muted() }))
+        .title(Span::styled(
+            title,
+            if focused {
+                theme::accent()
+            } else {
+                theme::muted()
+            },
+        ))
 }
 
 fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
     let st = &app.snap.module_stats;
     let left = vec![
         Line::from(Span::styled("Connection", theme::title())),
@@ -142,7 +204,11 @@ fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(format!(
             "  database {}",
-            if app.snap.db_ok { "connected" } else { "not ready" }
+            if app.snap.db_ok {
+                "connected"
+            } else {
+                "not ready"
+            }
         )),
         Line::from(format!("  workspace {}", empty(&app.snap.workspace))),
         Line::from(format!("  workspaces {}", app.snap.workspaces.join(", "))),
@@ -162,7 +228,10 @@ fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
             theme::warn(),
         )),
     ];
-    frame.render_widget(Paragraph::new(left).block(pane(" overview ", true)), cols[0]);
+    frame.render_widget(
+        Paragraph::new(left).block(pane(" overview ", true)),
+        cols[0],
+    );
 
     let mut right = vec![Line::from(Span::styled("Recent activity", theme::title()))];
     if app.audit.is_empty() {
@@ -170,22 +239,24 @@ fn draw_dash(frame: &mut Frame, app: &App, area: Rect) {
     }
     for e in app.audit.iter().rev().take(18) {
         right.push(Line::from(vec![
-            Span::styled(
-                format!("  {} ", ts_short(&e.ts)),
-                theme::muted(),
-            ),
+            Span::styled(format!("  {} ", ts_short(&e.ts)), theme::muted()),
             Span::styled(&e.action, theme::flag()),
             Span::styled(format!(" {}", truncate(&e.detail, 40)), theme::muted()),
         ]));
     }
-    frame.render_widget(
-        Paragraph::new(right).block(pane(" audit ", false)),
-        cols[1],
-    );
+    frame.render_widget(Paragraph::new(right).block(pane(" audit ", false)), cols[1]);
 }
 
 fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(area);
+    let cols = if area.width < 70 {
+        if app.host_pane == HostPane::List {
+            [area, Rect::default()]
+        } else {
+            [Rect::default(), area]
+        }
+    } else {
+        Layout::horizontal([Constraint::Length(30), Constraint::Min(1)]).areas(area)
+    };
     let ids = app.filtered_hosts();
     let mut lines = Vec::new();
     for (n, hi) in ids.iter().enumerate() {
@@ -200,15 +271,12 @@ fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
         };
         let mark = if sel { "▸" } else { " " };
         lines.push(Line::from(Span::styled(
-            format!(
-                "{mark} {:<16} {:<18} {:>2}svc {:>2}vuln  {}",
-                h.address,
-                truncate(&h.name, 18),
-                h.services.len(),
-                h.vulns.len(),
-                truncate(&h.os, 22)
-            ),
+            format!("{mark} {}", h.address),
             style,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {} · {} services", truncate(&h.os, 16), h.services.len()),
+            theme::muted(),
         )));
         if n > 40 {
             break;
@@ -221,7 +289,17 @@ fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(pane(" hosts  a plan  i import ", app.host_pane == HostPane::List)),
+        Paragraph::new(lines)
+            .scroll((
+                (ids.iter().position(|i| *i == app.host_idx).unwrap_or(0) * 2)
+                    .saturating_sub(cols[0].height.saturating_sub(4) as usize)
+                    as u16,
+                0,
+            ))
+            .block(pane(
+                " hosts  a plan  i import ",
+                app.host_pane == HostPane::List,
+            )),
         cols[0],
     );
 
@@ -252,7 +330,10 @@ fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
         detail.push(Line::from(""));
-        detail.push(Line::from(Span::styled("vulns", theme::title())));
+        detail.push(Line::from(Span::styled(
+            "Review plan · recorded findings",
+            theme::title(),
+        )));
         if h.vulns.is_empty() {
             detail.push(Line::from(Span::styled("  (none)", theme::muted())));
         }
@@ -280,13 +361,17 @@ fn draw_hosts(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new(detail).block(pane(" detail ", app.host_pane == HostPane::Detail)),
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_scroll, 0))
+            .block(pane(" detail ", app.host_pane == HostPane::Detail)),
         cols[1],
     );
 }
 
 fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(48), Constraint::Percentage(52)]).split(area);
     let names = app.current_modules();
     let mut lines = vec![Line::from(Span::styled(
         format!(
@@ -301,10 +386,7 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
         let star = if app.is_favorite(n) { "*" } else { " " };
         let style = if sel { theme::selected() } else { theme::bg() };
         let mark = if sel { "▸" } else { " " };
-        lines.push(Line::from(Span::styled(
-            format!("{mark}{star} {n}"),
-            style,
-        )));
+        lines.push(Line::from(Span::styled(format!("{mark}{star} {n}"), style)));
         if lines.len() > 40 {
             break;
         }
@@ -360,10 +442,7 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     } else {
-        info_lines.push(Line::from(Span::styled(
-            "select a module",
-            theme::muted(),
-        )));
+        info_lines.push(Line::from(Span::styled("select a module", theme::muted())));
     }
     frame.render_widget(
         Paragraph::new(info_lines)
@@ -374,7 +453,8 @@ fn draw_modules(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
-    let rows = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
+    let rows =
+        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
     let mut lines = Vec::new();
     for (i, s) in app.snap.sessions.iter().enumerate() {
         let sel = i == app.session_idx;
@@ -436,11 +516,15 @@ fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
             theme::muted(),
         )));
     }
-    frame.render_widget(Paragraph::new(body).block(pane(" interact ", app.interact)), rows[1]);
+    frame.render_widget(
+        Paragraph::new(body).block(pane(" interact ", app.interact)),
+        rows[1],
+    );
 }
 
 fn draw_creds(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
     let mut cl = vec![Line::from(Span::styled(
         format!("redact={}  x toggle  Ctrl-G reuse", app.report_redact),
         theme::muted(),
@@ -500,7 +584,8 @@ fn draw_creds(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     let mut jobs = Vec::new();
     for (i, j) in app.snap.jobs.iter().enumerate() {
         let sel = i == app.job_idx;
@@ -533,18 +618,28 @@ fn draw_tasks(frame: &mut Frame, app: &App, area: Rect) {
         )));
         if !t.detail.is_empty() && sel {
             for line in t.detail.lines().take(8) {
-                tasks.push(Line::from(Span::styled(format!("    {line}"), theme::muted())));
+                tasks.push(Line::from(Span::styled(
+                    format!("    {line}"),
+                    theme::muted(),
+                )));
             }
         }
     }
     if tasks.is_empty() {
-        tasks.push(Line::from(Span::styled("no local tasks yet", theme::muted())));
+        tasks.push(Line::from(Span::styled(
+            "no local tasks yet",
+            theme::muted(),
+        )));
     }
-    frame.render_widget(Paragraph::new(tasks).block(pane(" task log ", false)), cols[1]);
+    frame.render_widget(
+        Paragraph::new(tasks).block(pane(" task log ", false)),
+        cols[1],
+    );
 }
 
 fn draw_chains(frame: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area);
     let mut list = Vec::new();
     for (i, c) in app.chains.iter().enumerate() {
         let sel = i == app.chain_idx;
@@ -585,7 +680,10 @@ fn draw_reports(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(format!("sessions   {}", app.snap.sessions.len())),
         Line::from(format!("creds      {}", app.snap.creds.len())),
         Line::from(format!("loot       {}", app.snap.loot.len())),
-        Line::from(format!("redact secrets  {}   (x toggles)", app.report_redact)),
+        Line::from(format!(
+            "redact secrets  {}   (x toggles)",
+            app.report_redact
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "Ctrl-G writes HTML + Markdown + JSON under",
@@ -615,7 +713,10 @@ fn draw_console(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|l| Line::from(Span::styled(l.as_str(), theme::ok())))
         .collect();
-    frame.render_widget(Paragraph::new(body).block(pane(" msfconsole ", true)), rows[0]);
+    frame.render_widget(
+        Paragraph::new(body).block(pane(" msfconsole ", true)),
+        rows[0],
+    );
     let prompt = Paragraph::new(Line::from(vec![
         Span::styled(" msf6 > ", theme::accent()),
         Span::styled(&app.console_in.value, theme::flag()),
@@ -709,7 +810,10 @@ fn draw_wizards(frame: &mut Frame, app: &App, area: Rect) {
                     if sel { theme::selected() } else { theme::bg() },
                 )));
             }
-            v.push(Line::from(Span::styled("m next macro  Ctrl-G run", theme::muted())));
+            v.push(Line::from(Span::styled(
+                "m next macro  Ctrl-G run",
+                theme::muted(),
+            )));
             v
         }
         WizardKind::AutoPlan => {
@@ -769,7 +873,11 @@ fn draw_wizards(frame: &mut Frame, app: &App, area: Rect) {
 fn field<'a>(idx: usize, cur: usize, label: &'a str, value: &'a str) -> Line<'a> {
     let sel = idx == cur;
     Line::from(Span::styled(
-        format!("  {:<10} {}", label, if value.is_empty() { "…" } else { value }),
+        format!(
+            "  {:<10} {}",
+            label,
+            if value.is_empty() { "…" } else { value }
+        ),
         if sel { theme::selected() } else { theme::bg() },
     ))
 }
@@ -784,7 +892,7 @@ fn draw_help(frame: &mut Frame, area: Rect, scroll: u16) {
             .wrap(Wrap { trim: false })
             .block(
                 Block::bordered()
-                    .border_style(Style::default().fg(theme::PINK))
+                    .border_style(Style::default().fg(theme::pink()))
                     .title(Span::styled(" help  Esc ", theme::title())),
             ),
         rect,
@@ -802,7 +910,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, title: &str, body: &str) {
             .alignment(Alignment::Left)
             .block(
                 Block::bordered()
-                    .border_style(Style::default().fg(theme::ORANGE))
+                    .border_style(Style::default().fg(theme::orange()))
                     .title(Span::styled(format!(" {title} "), theme::warn())),
             ),
         rect,
@@ -819,12 +927,18 @@ fn draw_prompt(frame: &mut Frame, area: Rect, title: &str, value: &str, cursor: 
         .map(|(i, _)| i)
         .unwrap_or(value.len());
     shown.insert(byte, '▌');
+    let cursor_column = unicode_width::UnicodeWidthStr::width(&shown[..byte]);
+    let offset = cursor_column
+        .saturating_sub(rect.width.saturating_sub(4) as usize)
+        .min(u16::MAX as usize) as u16;
+
     frame.render_widget(
         Paragraph::new(shown)
+            .scroll((0, offset))
             .style(theme::bg())
             .block(
                 Block::bordered()
-                    .border_style(Style::default().fg(theme::PINK))
+                    .border_style(Style::default().fg(theme::pink()))
                     .title(Span::styled(format!(" {title} "), theme::accent())),
             ),
         rect,
@@ -847,17 +961,30 @@ fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(n.saturating_sub(1)).collect();
-        format!("{t}…")
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= n {
+        return s.to_owned();
     }
+    if n == 0 {
+        return String::new();
+    }
+    let mut text = String::new();
+    let mut width = 0;
+    for c in s.chars() {
+        let next = c.width().unwrap_or(0);
+        if width + next > n - 1 {
+            break;
+        }
+        text.push(c);
+        width += next;
+    }
+    text.push('…');
+    text
 }
 
 fn ts_short(ts: &str) -> String {
-    if ts.len() >= 19 {
-        ts[11..19].to_string()
+    if let Some(short) = ts.get(11..19) {
+        short.to_string()
     } else {
         ts.to_string()
     }
@@ -894,4 +1021,118 @@ fn tail_lines(s: &str, n: usize) -> Vec<String> {
         .skip(lines.len().saturating_sub(n))
         .map(|l| l.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod aurora_audit {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn commands() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)
+    }
+    fn fixture(dir: &std::path::Path) -> App {
+        for name in ["chains", "macros", "reports", "cache"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        let paths = crate::persist::Paths {
+            data: dir.into(),
+            config_dir: dir.into(),
+            config: dir.join("config.toml"),
+            audit: dir.join("audit.jsonl"),
+            chains: dir.join("chains"),
+            macros: dir.join("macros"),
+            reports: dir.join("reports"),
+            favorites: dir.join("favorites.toml"),
+            cache: dir.join("cache"),
+        };
+        let mut app = App::with_paths(true, paths).unwrap();
+        app.tab = Tab::Hosts;
+        app
+    }
+    #[test]
+    fn hosts_cycle_both_ways_and_inputs_own_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        app.handle_key(key(KeyCode::Tab));
+        assert!(app.host_pane == HostPane::Detail);
+        app.handle_key(key(KeyCode::Tab));
+        assert!(app.host_pane == HostPane::List);
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(commands());
+        assert!(!app.commands.open);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(commands());
+        assert!(app.commands.open);
+        assert!(app.demo);
+    }
+    #[test]
+    fn responsive_render_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = fixture(dir.path());
+        // One terminal exercises shrink/grow transitions, rather than independent initial frames.
+        let mut resizing = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for &(w, h) in &[
+            (120, 40),
+            (60, 20),
+            (80, 24),
+            (30, 10),
+            (100, 30),
+            (120, 40),
+        ] {
+            resizing.backend_mut().resize(w, h);
+            resizing.draw(|f| draw(f, &app)).unwrap();
+            assert_eq!(resizing.backend().buffer().area.width, w);
+        }
+        for &(w, h) in crate::audit::SIZES {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app)).unwrap();
+            let buffer = term.backend().buffer();
+            if w >= 30 && h >= 10 {
+                assert!(crate::audit::text(buffer).contains("breach"));
+            }
+            crate::audit::capture("breach", "main", buffer);
+        }
+        app.host_pane = HostPane::Detail;
+        for &(w, h) in &crate::audit::SIZES[..4] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app)).unwrap();
+            crate::audit::capture("breach", "focused", term.backend().buffer());
+        }
+        app.handle_key(commands());
+        for &(w, h) in &crate::audit::SIZES[..4] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app)).unwrap();
+            let buffer = term.backend().buffer();
+            assert!(crate::audit::text(buffer).contains("Actions"));
+            crate::audit::capture("breach", "actions", buffer);
+        }
+        app.commands.open = false;
+        app.snap = Default::default();
+        app.connected = false;
+        app.host_pane = HostPane::List;
+        for tab in Tab::all() {
+            app.tab = tab;
+            for &(w, h) in &crate::audit::SIZES[..4] {
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| draw(f, &app)).unwrap();
+                crate::audit::capture("breach", "offline", term.backend().buffer());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unicode_regressions {
+    use super::*;
+    #[test]
+    fn labels_fit_display_columns() {
+        use unicode_width::UnicodeWidthStr;
+        for width in 0..10 {
+            assert!(truncate("你好 🦀 cafe\u{301}", width).width() <= width);
+        }
+    }
 }
