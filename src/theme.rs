@@ -182,8 +182,8 @@ mod security_theme_persistence {
                 assert_eq!(bg_color(), palette::hex("171820"));
             }
             if id == "crimson" {
-                assert_eq!(selected().bg, Some(palette::hex("28151e")));
-                assert_eq!(selected().fg, Some(palette::hex("ff8298")));
+                assert_eq!(selected().bg, Some(palette::hex("211218")));
+                assert_eq!(selected().fg, Some(palette::hex("cf6578")));
             }
         }
         std::fs::write(&path, "host = \"localhost\"\n").unwrap();

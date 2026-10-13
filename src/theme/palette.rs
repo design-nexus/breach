@@ -640,11 +640,11 @@ pub fn crimson() -> Theme {
         "Crimson",
         Kind::Dark,
         [
-            "0b0d10", "07090c", "181c23", "343b47", "28151e", "d6dbe4", "8793a5", "8793a5",
-            "ff4d6d", "ff6b6b", "e5b56d", "7ac7a0", "64d8e8", "64d8e8", "ff4d6d",
+            "0b0d10", "07090c", "181c23", "343b47", "211218", "d6dbe4", "8793a5", "8793a5",
+            "c43b52", "cc5050", "e5b56d", "7ac7a0", "64d8e8", "64d8e8", "c43b52",
         ],
     );
-    theme.selection_fg = hex("ff8298");
+    theme.selection_fg = hex("cf6578");
     theme
 }
 #[cfg(test)]
@@ -656,10 +656,10 @@ mod crimson_tests {
         assert_eq!(theme.id, "crimson");
         assert!(CHOICES.iter().any(|c| c.id == "crimson"));
         assert_eq!(theme.bg, hex("0b0d10"));
-        assert_eq!(theme.accent, hex("ff4d6d"));
+        assert_eq!(theme.accent, hex("c43b52"));
         assert_eq!(theme.cyan, hex("64d8e8"));
-        assert_eq!(theme.selection, hex("28151e"));
-        assert_eq!(theme.selection_fg, hex("ff8298"));
+        assert_eq!(theme.selection, hex("211218"));
+        assert_eq!(theme.selection_fg, hex("cf6578"));
         assert_ne!(theme.green, theme.accent);
         assert_ne!(theme.yellow, theme.red);
         assert_eq!(resolve("unknown", None).id, "crimson");

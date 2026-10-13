@@ -46,6 +46,6 @@ Sweep and Breach now render their names as larger solid-red terminal pixels, wit
 
 ## Final shared pixel headers — 2026-10-13
 
-All five titles use the same native terminal pixel geometry and size. Glim, Platter, and Luma preserve their accent-to-data gradients. Sweep and Breach use a solid theme accent so their title color matches focused borders and shortcut caps (Crimson #FF4D6D by default). Long titles preserve connection status above the pixels when it cannot fit beside them. Updated actual Foot screenshots: `/home/ken/Projects/work/tui-previews/final-pixel/`.
+All five titles use the same native terminal pixel geometry and size. Glim, Platter, and Luma preserve their accent-to-data gradients. Sweep and Breach use a solid theme accent so their title color matches focused borders and shortcut caps (Crimson #C43B52 by default). Long titles preserve connection status above the pixels when it cannot fit beside them. Updated actual Foot screenshots: `/home/ken/Projects/work/tui-previews/final-pixel/`.
 
 Final verification: `cargo fmt --check`, `cargo test --locked`, and `cargo build --release --locked` passed. Installed binaries match those release builds. Four-size PTY checks in mouse and `--no-mouse` modes passed for all five apps, including navigation, resizing, clean exit, termios, alternate-screen restoration, and mouse release (40 checks total).
