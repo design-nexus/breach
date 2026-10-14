@@ -74,7 +74,7 @@ Chains wait for completion and refresh workspace data between operations. Matchi
 
 ## Theme
 
-Aurora is the default palette. `Ctrl+K` offers Aurora, Follow Omarchy, and Terminal themes. Use a terminal with 24-bit color (`kitty`, `wezterm`, `ghostty`, recent `alacritty`).
+Crimson is the default theme. `Ctrl+K` offers theme selection, including Aurora, Follow Omarchy, and Terminal. Use a terminal with 24-bit color (`kitty`, `wezterm`, `ghostty`, recent `alacritty`).
 
 ## Data
 
@@ -89,14 +89,14 @@ Aurora is the default palette. `Ctrl+K` offers Aurora, Follow Omarchy, and Termi
 ~/.local/share/nexus-msf/reports/<timestamp>-<workspace>/
 ```
 
-## Interface and themes
+## Interface
 
-New installations use Crimson: near-black surfaces, crimson focus and shortcuts, steel-gray text, cyan data, and distinct status colors. Aurora remains available through Ctrl+K actions. Existing explicit theme choices and legacy config/data locations are retained. `Ctrl+K` searches actions; Esc closes the palette. Actions use the same confirmations as their keyboard shortcuts. Tab / Shift+Tab changes screens; F6 / Shift+F6 changes panes. F2 opens Navigation. Details scroll with Page Up / Page Down. Narrow layouts show the active pane; the minimum terminal is 30×14.
+Existing explicit theme choices and legacy config/data locations are retained. `Ctrl+K` searches actions; Esc closes the palette. Actions use the same confirmations as their keyboard shortcuts. Tab / Shift+Tab changes screens; F6 / Shift+F6 changes panes. F2 opens Navigation. Details scroll with Page Up / Page Down. Narrow layouts show the active pane; the minimum terminal is 30×14.
 
 Build requirements: Rust 1.88 or newer, Ratatui 0.30.2, Crossterm 0.29. Run `cargo test --locked` before `./install.sh`. The command is `breach`; no compatibility command aliases are installed.
 
 See [shared navigation](docs/navigation.md) for keyboard and mouse controls.
 
-Screenshots show actual Foot renders with sample data. The security tools default to Crimson; select **Aurora theme** in Ctrl+K actions to restore the previous palette.
+Screenshots show actual Foot renders with sample data.
 
 See [Crimson theme](docs/themes.md) for selection and verification details.
